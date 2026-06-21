@@ -13,16 +13,16 @@ import sys
 
 np.set_printoptions(precision=3, suppress=True)
 
-B1_FREQ = 50
-B1_STEP_TIME = 1./B1_FREQ
-LOW_HIGH_RATE = 5
-Z1_FREQ = 500
+B1_FREQ = 50 # 底盘控制频率50hz
+B1_STEP_TIME = 1./B1_FREQ 
+LOW_HIGH_RATE = 5  # 低层控制频率和高层控制频率之间的倍率，目前代码里没有使用这个变量
+Z1_FREQ = 500 # Z1 机械臂可能按 500Hz 控制，代码没有使用
 
-LIN_VEL_X_CLIP = 0.15
-ANG_VEL_YAW_CLIP = 0.3
-ANG_VEL_PITCH_CLIP = ANG_VEL_YAW_CLIP
+LIN_VEL_X_CLIP = 0.15 # 线速度 x 方向最大 0.15
+ANG_VEL_YAW_CLIP = 0.3 # 角速度 yaw 方向最大 0.3
+ANG_VEL_PITCH_CLIP = ANG_VEL_YAW_CLIP  # pitch角速度最大0.3
 
-GAIT_WAIT_TIME = 35
+GAIT_WAIT_TIME = 35 # 等待步态稳定的时间 / 步态启动等待步数
 
 class ManipLoco_Policy():
     def __init__(self, args) -> None:

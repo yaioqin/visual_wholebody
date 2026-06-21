@@ -65,8 +65,9 @@ class ManipLoco(LeggedRobot):
 
         Args:
             actions (torch.Tensor): Tensor of shape (num_envs, num_actions_per_env)
+            前12维是底盘控制，后6维是机械臂控制
         """
-        actions[:, 12:] = 0.
+        actions[:, 12:] = 0. 
         actions = self._reindex_all(actions)
         actions = torch.clip(actions, -self.clip_actions, self.clip_actions).to(self.device)
         # step physics and render each frame
@@ -935,6 +936,9 @@ class ManipLoco(LeggedRobot):
 
         Args:
             env_ids (List[int]): Environments ids for which new commands are needed
+        commands[:, 0] = 期望前进速度 lin_vel_x
+        commands[:, 1] = 期望侧向速度，这里固定为 0
+        commands[:, 2] = 期望 yaw 角速度
         """
 
         if self.cfg.env.teleop_mode:
@@ -1024,6 +1028,7 @@ class ManipLoco(LeggedRobot):
     def _post_physics_step_callback(self):
         """ Callback called before computing terminations, rewards, and observations
             Default behaviour: Compute ang vel command based on target and heading, compute measured terrain heights and randomly push robots
+        self.cfg.commands.resampling_time:每隔 3 秒重新采样一次速度命令。
         """
         command_env_ids = (self.episode_length_buf % int(self.cfg.commands.resampling_time / self.dt)==0).nonzero(as_tuple=False).flatten()
         self._resample_commands(command_env_ids)

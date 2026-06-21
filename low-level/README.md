@@ -11,7 +11,8 @@ The environment related code is `legged_gym/legged_gym/envs/manip_loco/manip_loc
 
 ```bash
 cd legged_gym/scripts
-python train.py --headless --exptid SOME_YOUR_DESCRIPTION --proj_name b1z1-low --task b1z1 --sim_device cuda:0 --rl_device cuda:0 --observe_gait_commands
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+python train.py --headless --exptid SOME_YOUR_DESCRIPTION --proj_name b1z1-low --task b1z1 --sim_device cuda:1 --rl_device cuda:1 --observe_gait_commands
 ```
 - `--debug` disables wandb and set a small number of envs for faster execution.
 - `--headless` disables rendering, typically used when you train model.
