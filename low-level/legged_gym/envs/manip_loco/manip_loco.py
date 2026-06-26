@@ -129,10 +129,15 @@ class ManipLoco(LeggedRobot):
             dpos = self.curr_ee_goal_cart_world - self.ee_pos
             drot = orientation_error(self.ee_goal_orn_quat, self.ee_orn / torch.norm(self.ee_orn, dim=-1).unsqueeze(-1))
             dpose = torch.cat([dpos, drot], -1).unsqueeze(-1)
-            arm_pos_targets = self._control_ik(dpose) + self.dof_pos[:, self.arm_dof_indices_tensor]
+            arm_dof_slice = self._scripted_arm_dof_slice()
+            arm_jacobian = self.jacobian_whole[:, self.gripper_idx, :6, arm_dof_slice]
+            arm_pos_targets = self._control_ik(dpose, arm_jacobian=arm_jacobian) + self.dof_pos[:, arm_dof_slice]
             # self.last_arm_delta_action[:] = 0.
         all_pos_targets = torch.zeros_like(self.dof_pos)
-        all_pos_targets[:, self.arm_dof_indices_tensor] = arm_pos_targets
+        if self.use_policy_arm_delta_action:
+            all_pos_targets[:, self.arm_dof_indices_tensor] = arm_pos_targets
+        else:
+            all_pos_targets[:, self._scripted_arm_dof_slice()] = arm_pos_targets
 
         for t in range(self.cfg.control.decimation):
             self.torques = self._compute_torques(self.actions)
@@ -1399,9 +1404,14 @@ class ManipLoco(LeggedRobot):
                 pose = gymapi.Transform(gymapi.Vec3(ee_target_all_cart_world[i, 0, j], ee_target_all_cart_world[i, 1, j], ee_target_all_cart_world[i, 2, j]), r=None)
                 gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], pose)
 
-    def _control_ik(self, dpose):
+    def _scripted_arm_dof_slice(self):
+        gripper_joints = self.cfg.env.num_gripper_joints
+        slice_end = -gripper_joints if gripper_joints > 0 else None
+        return slice(-(6 + gripper_joints), slice_end)
+
+    def _control_ik(self, dpose, arm_jacobian=None):
         # solve damped least squares
-        self.ee_j_eef = self.get_arm_jacobian(refresh=False)
+        self.ee_j_eef = arm_jacobian if arm_jacobian is not None else self.get_arm_jacobian(refresh=False)
         j_eef_T = torch.transpose(self.ee_j_eef, 1, 2)
         lmbda = torch.eye(6, device=self.device) * (0.05 ** 2)
         A = torch.bmm(self.ee_j_eef, j_eef_T) + lmbda[None, ...]

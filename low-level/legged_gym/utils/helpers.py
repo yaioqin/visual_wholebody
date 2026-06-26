@@ -144,6 +144,9 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
             env_cfg.commands.use_5d_base_command = False
         if args.disable_arm_base_message and hasattr(env_cfg, "multi_agent"):
             env_cfg.multi_agent.use_arm_base_message = False
+        if args.allow_arm_policy_action and hasattr(env_cfg, "multi_agent"):
+            env_cfg.multi_agent.use_arm_delta_action = True
+            env_cfg.multi_agent.allow_arm_policy_action = True
         if args.record_video:
             env_cfg.env.record_video = args.record_video
         if args.stand_by:
@@ -182,6 +185,7 @@ def get_args(test=False):
         {"name": "--observe_gait_commands", "action": "store_true", "help": "if observe gait commands, ref to <walk these ways>"},
         {"name": "--disable_5d_base_command", "action": "store_true", "default": False, "help": "Disable 5D base command observation for old checkpoints"},
         {"name": "--disable_arm_base_message", "action": "store_true", "default": False, "help": "Disable arm-to-base message observation for old checkpoints"},
+        {"name": "--allow_arm_policy_action", "action": "store_true", "default": False, "help": "Allow the policy's last 6 actions to drive the arm delta IK controller"},
         
         {"name": "--exptid", "type": str,  "required": True if not test else False,  "help": "Experiment ID"},
         {"name": "--debug", "action": "store_true", "default": False, "help": "Disable wandb logging"},

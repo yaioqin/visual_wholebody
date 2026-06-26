@@ -29,3 +29,13 @@ python train.py  \
 
 
 python play.py --exptid MARL_b1_z1_5D_base_command --task b1z1 --proj_name b1z1-low --checkpoint 45000 --sim_device cpu --rl_device cpu --observe_gait_commands --record_video
+
+
+python train.py  \
+  --exptid MARL_b1_z1_5D_base_command --proj_name b1z1-low --task b1z1 \
+  --sim_device cuda:1 \
+  --rl_device cuda:1 \
+  --observe_gait_commands \
+  --headless
+
+python play.py --exptid MARL_b1_z1_5D_base_command --task b1z1 --proj_name b1z1-low --checkpoint 45000  --observe_gait_commands 
