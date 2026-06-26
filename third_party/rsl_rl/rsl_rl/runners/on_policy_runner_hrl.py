@@ -11,6 +11,7 @@ from rsl_rl.env import VecEnv
 
 import wandb
 from torchinfo import summary
+from .on_policy_runner import _format_progress_bar, _format_seconds
 
 class OnPolicyRunnerHRL:
     def __init__(self, 
@@ -97,7 +98,12 @@ class OnPolicyRunnerHRL:
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         
+        progress_start_time = time.time()
         tot_iter = self.current_learning_iteration + num_learning_iterations
+        print(
+            f"Training progress: {num_learning_iterations} iterations "
+            f"(from {self.current_learning_iteration} to {tot_iter})"
+        )
         
         for it in range(self.current_learning_iteration, tot_iter):
             start = time.time()
@@ -138,14 +144,31 @@ class OnPolicyRunnerHRL:
             mean_value_loss, mean_surrogate_loss = self.alg.update()
             stop = time.time()
             learn_time = stop - start
+            completed_iterations = it - (tot_iter - num_learning_iterations) + 1
+            elapsed_time = stop - progress_start_time
+            avg_iteration_time = elapsed_time / completed_iterations
+            remaining_iterations = num_learning_iterations - completed_iterations
+            remaining_training_time = avg_iteration_time * remaining_iterations
             if self.log_dir is not None:
                 self.log(locals())
             if it % self.save_interval == 0:
                 self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+            fps = int(self.num_steps_per_env * self.env.num_envs / (collection_time + learn_time))
+            progress_bar = _format_progress_bar(completed_iterations, num_learning_iterations)
+            print(
+                f"Training progress {progress_bar} "
+                f"{completed_iterations}/{num_learning_iterations} "
+                f"(global iteration {it + 1}/{tot_iter}) | "
+                f"fps: {fps} | iter: {collection_time + learn_time:.2f}s | "
+                f"elapsed: {_format_seconds(elapsed_time)} | "
+                f"remaining: {_format_seconds(remaining_training_time)}",
+                flush=True,
+            )
             ep_infos.clear()
         
         self.current_learning_iteration += num_learning_iterations
         self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
+        print(f"Training progress complete: {num_learning_iterations}/{num_learning_iterations} iterations")
         
     def log(self, locs, width=80, pad=35):
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
@@ -183,6 +206,10 @@ class OnPolicyRunnerHRL:
         wandb_dict['Perf/total_fps'] = fps
         wandb_dict['Perf/collection_time'] = locs['collection_time']
         wandb_dict['Perf/learning_time'] = locs['learn_time']
+        if 'remaining_training_time' in locs:
+            wandb_dict['Perf/elapsed_training_time_s'] = locs['elapsed_time']
+            wandb_dict['Perf/remaining_training_time_s'] = locs['remaining_training_time']
+            wandb_dict['Perf/avg_iteration_time_s'] = locs['avg_iteration_time']
         if len(locs['rewbuffer']) > 0:
             wandb_dict['Train/mean_reward'] = statistics.mean(locs['rewbuffer'])
             wandb_dict['Train/mean_episode_length'] = statistics.mean(locs['lenbuffer'])
@@ -217,12 +244,15 @@ class OnPolicyRunnerHRL:
                           f"""{'action noise std distribution:':>{pad}} {std_numpy.tolist()}\n""")
             
         log_string += ep_string
+        remaining_training_time = locs.get('remaining_training_time', None)
+        remaining_line = ""
+        if remaining_training_time is not None:
+            remaining_line = f"""{'Remaining training time:':>{pad}} {_format_seconds(remaining_training_time)} ({remaining_training_time:.1f}s)\n"""
         log_string += (f"""{'-' * width}\n"""
                        f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""
                        f"""{'Iteration time:':>{pad}} {iteration_time:.2f}s\n"""
                        f"""{'Total time:':>{pad}} {self.tot_time:.2f}s\n"""
-                       f"""{'ETA:':>{pad}} {self.tot_time / (locs['it'] + 1) * (
-                               locs['num_learning_iterations'] - locs['it']):.1f}s\n""")
+                       f"""{remaining_line}""")
         print(log_string)
         
     def save(self, path, infos=None):

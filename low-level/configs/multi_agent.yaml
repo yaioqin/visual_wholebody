@@ -1,0 +1,56 @@
+multi_agent:
+  enabled: false
+  train_stage: base
+
+  # Current supported path: 18D low-level PPO only.
+  use_arm_delta_action: true
+  allow_arm_policy_action: false
+  arm_chunk_horizon: 1
+  fixed_h: 1
+  disable_gripper: true
+  use_high_level_policy: false
+
+  # Observation/reward switches for the existing low-level environment.
+  use_arm_base_message: true
+  use_assist_reward: false
+
+  # Gripper defaults.
+  use_learnable_gripper: false
+  rho_threshold: 0.75
+  terminal_motion_threshold: 0.02
+
+  # Freeze plan for staged training.
+  freeze_base_policy: true
+  freeze_gripper_policy: true
+  freeze_high_level_policy: false
+
+  # Structured action dimensions for retained utilities. Not used by the
+  # current low-level PPO path.
+  base_command_dim: 5
+  ee_delta_dim: 6
+  chunk_horizon: 1
+  grasp_intent_dim: 1
+  h_choice_dim: 3
+  total_action_dim: 15
+
+  # Action safety limits. Keep these in config, not in model weights.
+  max_ee_pos_delta: 0.05
+  max_ee_rot_delta: 0.2
+  max_joint_delta: 0.25
+  max_vx: 0.5
+  max_vy: 0.3
+  max_yaw_rate: 0.8
+  min_base_height: 0.32
+  max_base_height: 0.45
+  max_pitch: 0.3
+
+  # Arm-base assist reward.
+  eta_threshold: 0.02
+  action_amplitude_threshold: 0.01
+  assist_reward_scale: 0.05
+
+commands:
+  use_5d_base_command: true
+  ranges:
+    base_pitch: [-0.3, 0.3]
+    base_height: [0.32, 0.45]

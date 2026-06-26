@@ -43,6 +43,8 @@ from legged_gym.envs.base.legged_robot import LeggedRobot
 from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.utils.helpers import class_to_dict
 from legged_gym.utils.terrain import Terrain, Terrain_Perlin
+from legged_gym.models.message_passing import MultiAgentMessageBuilder
+from legged_gym.controllers.arm_ik_controller import ArmIKController, ArmIKControllerConfig
 from .b1z1_config import B1Z1RoughCfg
 
 import sys
@@ -52,6 +54,25 @@ class ManipLoco(LeggedRobot):
     cfg: B1Z1RoughCfg
 
     def __init__(self, cfg, *args, **kwargs):
+        multi_agent_cfg = getattr(cfg, "multi_agent", None)
+        command_cfg = getattr(cfg, "commands", None)
+        self.use_arm_delta_action = bool(getattr(multi_agent_cfg, "use_arm_delta_action", False))
+        self.allow_arm_policy_action = bool(getattr(multi_agent_cfg, "allow_arm_policy_action", False))
+        self.use_policy_arm_delta_action = self.use_arm_delta_action and self.allow_arm_policy_action
+        self.use_arm_base_message = bool(getattr(multi_agent_cfg, "use_arm_base_message", False))
+        self.use_5d_base_command = bool(getattr(command_cfg, "use_5d_base_command", False))
+        self.command_obs_dim = 5 if self.use_5d_base_command else 3
+        cfg.commands.num_commands = self.command_obs_dim
+
+        base_num_proprio = getattr(cfg.env, "base_num_proprio", cfg.env.num_proprio)
+        cfg.env.num_proprio = base_num_proprio + (self.command_obs_dim - 3) + (5 if self.use_arm_base_message else 0)
+        cfg.env.num_observations = cfg.env.num_proprio * (cfg.env.history_len+1) + cfg.env.num_priv
+        if self.use_5d_base_command:
+            print("||||||||||Use 5D base commands!")
+        if self.use_arm_base_message:
+            print("||||||||||Append arm-to-base message to proprioception!")
+        if self.use_arm_delta_action and not self.allow_arm_policy_action:
+            print("||||||||||Arm policy delta action disabled; using scripted arm IK target!")
         if cfg.env.observe_gait_commands:
             print("||||||||||Observe gait commands!")
             cfg.env.num_proprio += 5 # gait_indices=1, clock_phase=4
@@ -67,19 +88,25 @@ class ManipLoco(LeggedRobot):
             actions (torch.Tensor): Tensor of shape (num_envs, num_actions_per_env)
             前12维是底盘控制，后6维是机械臂控制
         """
-        actions[:, 12:] = 0. 
-        actions = self._reindex_all(actions)
+        actions = actions.clone()
+        if not self.use_policy_arm_delta_action:
+            actions[:, 12:] = 0.
+        actions = self._reindex_all(actions) # 调整关节顺序，policy 输出的腿顺序和Isaac Gym 里 URDF/MJCF 的 DOF 顺序不一致
         actions = torch.clip(actions, -self.clip_actions, self.clip_actions).to(self.device)
         # step physics and render each frame
         self.render()
-        if self.action_delay != -1:
+        if self.action_delay != -1: # 维护一个 action 历史队列
             self.action_history_buf = torch.cat([self.action_history_buf[:, 1:], actions[:, None, :]], dim=1)
             # actions = self.action_history_buf[:, -self.action_delay - 1] # delay for 1/50=20ms
-        if self.global_steps < 10000 * 24:
-            actions = self.action_history_buf[:, -1]
+        if self.global_steps < 10000 * 24: 
+            actions = self.action_history_buf[:, -1].clone() # 训练前期使用最新 action
         else:
-            actions = self.action_history_buf[:, -2]
+            actions = self.action_history_buf[:, -2].clone() # 训练后期使用前一帧 action，人为加入一点 action delay，提高 sim-to-real 鲁棒性。
 
+        if not self.use_policy_arm_delta_action:
+            actions[:, 12:] = 0.
+        else:
+            actions[:, 12:18] = self._clip_arm_delta_action(actions[:, 12:18])
         self.actions = actions.clone()
         
         # arm ik actions
@@ -88,12 +115,24 @@ class ManipLoco(LeggedRobot):
         # ee_goal_cart_yaw_global = quat_apply(self.base_yaw_quat, self.curr_ee_goal_cart)
         # curr_ee_goal_cart_world = self._get_ee_goal_spherical_center() + ee_goal_cart_yaw_global
         
-        dpos = self.curr_ee_goal_cart_world - self.ee_pos
-        drot = orientation_error(self.ee_goal_orn_quat, self.ee_orn / torch.norm(self.ee_orn, dim=-1).unsqueeze(-1))
-        dpose = torch.cat([dpos, drot], -1).unsqueeze(-1)
-        arm_pos_targets = self._control_ik(dpose) + self.dof_pos[:, -(6 + self.cfg.env.num_gripper_joints):-self.cfg.env.num_gripper_joints]
+        if self.use_policy_arm_delta_action:
+            arm_delta_action = actions[:, 12:18]
+            arm_pos_targets = self.arm_ik_controller.step(
+                current_ee_pos=self.ee_pos,
+                current_ee_rot=self.ee_orn,
+                current_arm_q=self.dof_pos[:, self.arm_dof_indices_tensor],
+                arm_delta_action=arm_delta_action,
+                jacobian=self.get_arm_jacobian(),
+            )
+            # self.last_arm_delta_action[:] = arm_delta_action.detach()
+        else:
+            dpos = self.curr_ee_goal_cart_world - self.ee_pos
+            drot = orientation_error(self.ee_goal_orn_quat, self.ee_orn / torch.norm(self.ee_orn, dim=-1).unsqueeze(-1))
+            dpose = torch.cat([dpos, drot], -1).unsqueeze(-1)
+            arm_pos_targets = self._control_ik(dpose) + self.dof_pos[:, self.arm_dof_indices_tensor]
+            # self.last_arm_delta_action[:] = 0.
         all_pos_targets = torch.zeros_like(self.dof_pos)
-        all_pos_targets[:, -(6 + self.cfg.env.num_gripper_joints):-self.cfg.env.num_gripper_joints] = arm_pos_targets
+        all_pos_targets[:, self.arm_dof_indices_tensor] = arm_pos_targets
 
         for t in range(self.cfg.control.decimation):
             self.torques = self._compute_torques(self.actions)
@@ -152,6 +191,7 @@ class ManipLoco(LeggedRobot):
         # compute observations, rewards, resets, ...
         self.check_termination()
         self.compute_reward()
+        self._update_low_level_log_diagnostics()
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         self.reset_idx(env_ids, start=False)
         self.compute_observations() # in some cases a simulation step might be required to refresh some obs (for example body positions)
@@ -215,10 +255,18 @@ class ManipLoco(LeggedRobot):
     def compute_observations(self):
         """ Computes observations
         """
+        ee_delta_pos = self.curr_ee_goal_cart_world - self.ee_pos
+        if self.use_arm_base_message:
+            self._update_multi_agent_messages(ee_delta_pos)
+
         arm_base_pos = self.base_pos + quat_apply(self.base_yaw_quat, self.arm_base_offset)
         ee_goal_local_cart = quat_rotate_inverse(self.base_quat, self.curr_ee_goal_cart_world - arm_base_pos)
         if self.stand_by:
-            self.commands[:] = 0.
+            self.commands[:, :3] = 0.
+            if self.use_5d_base_command:
+                self.commands[:, 3] = 0.
+                self.commands[:, 4] = self.cfg.rewards.base_height_target
+                self._clamp_base_commands()
 
         obs_buf = torch.cat((       self._get_body_orientation(),  # dim 2
                                     self.base_ang_vel * self.obs_scales.ang_vel,  # dim 3
@@ -226,11 +274,14 @@ class ManipLoco(LeggedRobot):
                                     self._reindex_all(self.dof_vel * self.obs_scales.dof_vel)[:, :-self.cfg.env.num_gripper_joints],  # dim 18
                                     self._reindex_all(self.action_history_buf[:, -1])[:, :12],  # dim 12
                                     self._reindex_feet(self.foot_contacts_from_sensor),  # dim 4
-                                    self.commands[:, :3] * self.commands_scale,  # dim 3
+                                    self.commands[:, :self.command_obs_dim] * self.commands_scale,  # dim 3 or 5
                                     # self.curr_ee_goal_sphere,  # dim 3 position
                                     ee_goal_local_cart,  # dim 3 position
                                     0*self.curr_ee_goal_sphere  # dim 3 orientation
                                     ),dim=-1)
+        if self.use_arm_base_message:
+            obs_buf = torch.cat((obs_buf, self.m_a2b), dim=-1)
+
         if self.cfg.env.observe_gait_commands:
             obs_buf = torch.cat((obs_buf,
                                       self.gait_indices.unsqueeze(1), self.clock_inputs), dim=-1)
@@ -255,6 +306,11 @@ class ManipLoco(LeggedRobot):
         if self.add_noise:
             self.obs_buf += (2 * torch.rand_like(self.obs_buf) - 1) * self.noise_scale_vec
 
+        assert self.obs_buf.shape[1] == self.cfg.env.num_observations, (
+            self.obs_buf.shape[1],
+            self.cfg.env.num_observations,
+        )
+
     def check_termination(self):
         """ Check if environments need to be reset
         """
@@ -276,6 +332,40 @@ class ManipLoco(LeggedRobot):
         # ik_fail = (self.curr_ee_goal_cart[:, -1:] - curr_ee_pos_local[:, -1:]).norm(dim=-1) > 0.3
         # self.reset_buf = termination_contact_buf | self.time_out_buf | r_term | p_term | z_term | ik_fail
         self.reset_buf = termination_contact_buf | self.time_out_buf | r_term | p_term | z_term
+
+    def _update_low_level_log_diagnostics(self):
+        """Cache low-level tracking diagnostics before reset/last-action updates."""
+        commands = self.commands
+        root_z = self.root_states[:, 2]
+        base_pitch = self._get_body_orientation()[:, 1]
+        command_vy = commands[:, 1] if commands.shape[1] > 1 else torch.zeros_like(self.base_lin_vel[:, 1])
+        command_base_pitch = commands[:, 3] if commands.shape[1] > 3 else torch.zeros_like(base_pitch)
+        command_base_height = (
+            commands[:, 4]
+            if commands.shape[1] > 4
+            else torch.ones_like(root_z) * self.cfg.rewards.base_height_target
+        )
+        action_dim = min(12, self.actions.shape[1], self.last_actions.shape[1])
+        action_rate = torch.sum(torch.square(self.last_actions[:, :action_dim] - self.actions[:, :action_dim]), dim=1)
+        fall_buf = self.reset_buf.bool()
+        if hasattr(self, "time_out_buf"):
+            fall_buf = fall_buf & ~self.time_out_buf.bool()
+
+        self.low_level_log_diagnostics = {
+            "mean_abs_vx_error": torch.mean(torch.abs(self.base_lin_vel[:, 0] - commands[:, 0])),
+            "mean_abs_vy_error": torch.mean(torch.abs(self.base_lin_vel[:, 1] - command_vy)),
+            "mean_abs_yaw_rate_error": torch.mean(torch.abs(self.base_ang_vel[:, 2] - commands[:, 2])),
+            "mean_abs_base_pitch_error": torch.mean(torch.abs(base_pitch - command_base_pitch)),
+            "mean_abs_base_height_error": torch.mean(torch.abs(root_z - command_base_height)),
+            "mean_base_height_command": torch.mean(command_base_height),
+            "mean_base_pitch_command": torch.mean(command_base_pitch),
+            "mean_root_z": torch.mean(root_z),
+            "episode_length_mean": torch.mean(self.episode_length_buf.float()),
+            "reset_rate": torch.mean(self.reset_buf.float()),
+            "fall_rate": torch.mean(fall_buf.float()),
+            "torque_penalty": torch.mean(torch.sum(torch.square(self.torques), dim=1)),
+            "action_rate_penalty": torch.mean(action_rate),
+        }
 
     def create_sim(self):
         """ Creates simulation, terrain and evironments
@@ -510,6 +600,10 @@ class ManipLoco(LeggedRobot):
             self.sensor_indices.append(sensor_idx)
         
         self.gripper_idx = self.body_names_to_idx[self.cfg.asset.gripper_name]
+        self.ee_body_name = getattr(self.cfg.multi_agent, "ee_body_name", self.cfg.asset.gripper_name)
+        self.ee_body_idx = self.body_names_to_idx[self.ee_body_name]
+        self.arm_dof_names = list(getattr(self.cfg.multi_agent, "arm_dof_names", self.dof_names[12:18]))
+        self.arm_dof_indices = [self.dof_names_to_idx[name] for name in self.arm_dof_names]
 
         # box
         asset_options = gymapi.AssetOptions()
@@ -558,6 +652,8 @@ class ManipLoco(LeggedRobot):
             self.gym.set_asset_rigid_shape_properties(robot_asset, rigid_shape_props)
             robot_dog_handle = self.gym.create_actor(env_handle, robot_asset, start_pose, "robot_dog", i, self.cfg.asset.self_collisions, 0)
             self.actor_handles.append(robot_dog_handle)
+            if i == 0 and getattr(self.cfg.multi_agent, "debug_print_kinematics_names", False):
+                self._debug_print_kinematics_names(env_handle, robot_dog_handle)
 
             dof_props = self._process_dof_props(dof_props_asset, i)
             self.gym.set_actor_dof_properties(env_handle, robot_dog_handle, dof_props)
@@ -631,6 +727,21 @@ class ManipLoco(LeggedRobot):
                 camera_handle = self.gym.create_camera_sensor(self.envs[i], camera_props)
                 self._rendering_camera_handles.append(camera_handle)
                 self.gym.set_camera_location(camera_handle, self.envs[i], gymapi.Vec3(*cam_pos), gymapi.Vec3(*0*cam_pos))
+
+    def _debug_print_kinematics_names(self, env_handle, actor_handle):
+        try:
+            dof_names = self.gym.get_actor_dof_names(env_handle, actor_handle)
+            rigid_body_names = self.gym.get_actor_rigid_body_names(env_handle, actor_handle)
+        except AttributeError:
+            dof_names = self.dof_names
+            rigid_body_names = self.body_names
+
+        print("[DOF NAMES]")
+        for idx, name in enumerate(dof_names):
+            print(f"{idx}: {name}")
+        print("[RIGID BODY NAMES]")
+        for idx, name in enumerate(rigid_body_names):
+            print(f"{idx}: {name}")
     
     def _process_rigid_body_props(self, props, env_id):
         if self.cfg.domain_rand.randomize_base_mass:
@@ -749,6 +860,7 @@ class ManipLoco(LeggedRobot):
         self.box_rigid_body_state = self._rigid_body_state[:, -1, :]
 
         self.jacobian_whole = gymtorch.wrap_tensor(jacobian_tensor)
+        self.arm_dof_indices_tensor = torch.tensor(self.arm_dof_indices, dtype=torch.long, device=self.device)
         self.foot_velocities = self.rigid_body_state.view(self.num_envs, self.num_bodies, 13)[:,
                                self.feet_indices,
                                7:10]
@@ -759,7 +871,14 @@ class ManipLoco(LeggedRobot):
         self.ee_pos = self.rigid_body_state[:, self.gripper_idx, :3]
         self.ee_orn = self.rigid_body_state[:, self.gripper_idx, 3:7]
         self.ee_vel = self.rigid_body_state[:, self.gripper_idx, 7:]
-        self.ee_j_eef = self.jacobian_whole[:, self.gripper_idx, :6, -(6 + self.cfg.env.num_gripper_joints):-self.cfg.env.num_gripper_joints]
+        self.ee_j_eef = self.get_arm_jacobian(refresh=False)
+        chunk_horizon = getattr(getattr(self.cfg, "multi_agent", None), "arm_chunk_horizon", 1)
+        assert chunk_horizon == 1, "Current low-level training expects arm_chunk_horizon == 1"
+        self.prev_arm_action_chunk = torch.zeros(self.num_envs, chunk_horizon, 6, device=self.device)
+        # self.last_arm_delta_action = torch.zeros(self.num_envs, 6, device=self.device)
+        self.m_a2b = torch.zeros(self.num_envs, 5, device=self.device)
+        self.m_a2g = torch.zeros(self.num_envs, 2, device=self.device)
+        self.object_pos_wrist = torch.zeros(self.num_envs, 3, device=self.device)
 
         # box info & target_ee info
         self.box_pos = self.box_root_state[:, 0:3]
@@ -832,9 +951,11 @@ class ManipLoco(LeggedRobot):
         self.last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
         self.last_torques = torch.zeros_like(self.torques)
 
-        self.commands = torch.zeros(self.num_envs, self.cfg.commands.num_commands, dtype=torch.float, device=self.device, requires_grad=False) # x vel, y vel, yaw vel, heading
-        self.commands_scale = torch.tensor([self.obs_scales.lin_vel, self.obs_scales.lin_vel, self.obs_scales.ang_vel],
-                                           device=self.device, requires_grad=False, )[:self.cfg.commands.num_commands]
+        self.commands = torch.zeros(self.num_envs, self.cfg.commands.num_commands, dtype=torch.float, device=self.device, requires_grad=False)
+        command_scales = [self.obs_scales.lin_vel, self.obs_scales.lin_vel, self.obs_scales.ang_vel]
+        if self.command_obs_dim == 5:
+            command_scales += [1.0, 1.0]
+        self.commands_scale = torch.tensor(command_scales, device=self.device, requires_grad=False)[:self.cfg.commands.num_commands]
         # Refer to <walk these ways>, only useful when `self.cfg.env.observe_gait_commands` is True
         self.desired_contact_states = torch.zeros(self.num_envs, 4, dtype=torch.float, device=self.device,
                                                   requires_grad=False, )
@@ -877,6 +998,16 @@ class ManipLoco(LeggedRobot):
                     raise Exception(f"PD gain of joint {name} were not defined, setting them to zero")
         # self.default_dof_pos = self.default_dof_pos.unsqueeze(0)
         self.default_dof_pos_wo_gripper = self.default_dof_pos[:-self.cfg.env.num_gripper_joints]
+        self.arm_ik_controller = ArmIKController(
+            num_arm_joints=6,
+            joint_lower_limits=self.dof_pos_limits[self.arm_dof_indices_tensor, 0],
+            joint_upper_limits=self.dof_pos_limits[self.arm_dof_indices_tensor, 1],
+            config=ArmIKControllerConfig(
+                max_ee_pos_delta=self.cfg.multi_agent.max_ee_pos_delta,
+                max_ee_rot_delta=self.cfg.multi_agent.max_ee_rot_delta,
+                max_joint_delta=self.cfg.multi_agent.max_joint_delta,
+            ),
+        )
         
         self.global_steps = 0
 
@@ -911,7 +1042,7 @@ class ManipLoco(LeggedRobot):
         max_vel = self.cfg.domain_rand.max_push_vel_xy
         self.root_states[:, 7:9] = torch_rand_float(-max_vel, max_vel, (self.num_envs, 2), device=self.device) # lin vel x/y
         self.root_states[:, 7:9] = torch.where(
-            self.commands.sum(dim=1).unsqueeze(-1) == 0,
+            self.commands[:, :3].sum(dim=1).unsqueeze(-1) == 0,
             self.root_states[:, 7:9] * 2.5,
             self.root_states[:, 7:9]
         )
@@ -949,10 +1080,29 @@ class ManipLoco(LeggedRobot):
         else:
             self.commands[env_ids, 0] = torch_rand_float(self.command_ranges["lin_vel_x"][0], self.command_ranges["lin_vel_x"][1], (len(env_ids), 1), device=self.device).squeeze(1)
 
-        self.commands[env_ids, 1] = 0
+        if self.use_5d_base_command:
+            self.commands[env_ids, 1] = torch_rand_float(self.command_ranges["lin_vel_y"][0], self.command_ranges["lin_vel_y"][1], (len(env_ids), 1), device=self.device).squeeze(1)
+        else:
+            self.commands[env_ids, 1] = 0
         self.commands[env_ids, 2] = torch_rand_float(self.command_ranges["ang_vel_yaw"][0], self.command_ranges["ang_vel_yaw"][1], (len(env_ids), 1), device=self.device).squeeze(1)
+        if self.use_5d_base_command:
+            self.commands[env_ids, 3] = torch_rand_float(self.command_ranges["base_pitch"][0], self.command_ranges["base_pitch"][1], (len(env_ids), 1), device=self.device).squeeze(1)
+            self.commands[env_ids, 4] = torch_rand_float(self.command_ranges["base_height"][0], self.command_ranges["base_height"][1], (len(env_ids), 1), device=self.device).squeeze(1)
         # set small commands to zero
-        self.commands[env_ids, :] *= (torch.logical_or(torch.abs(self.commands[env_ids, 0]) > self.cfg.commands.lin_vel_x_clip, torch.abs(self.commands[env_ids, 2]) > self.cfg.commands.ang_vel_yaw_clip)).unsqueeze(1)
+        moving_mask = torch.logical_or(torch.abs(self.commands[env_ids, 0]) > self.cfg.commands.lin_vel_x_clip, torch.abs(self.commands[env_ids, 2]) > self.cfg.commands.ang_vel_yaw_clip)
+        self.commands[env_ids, :3] *= moving_mask.unsqueeze(1)
+        self._clamp_base_commands(env_ids)
+
+    def _clamp_base_commands(self, env_ids=None):
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        self.commands[env_ids, 0] = torch.clamp(self.commands[env_ids, 0], self.command_ranges["lin_vel_x"][0], self.command_ranges["lin_vel_x"][1])
+        if self.use_5d_base_command:
+            self.commands[env_ids, 1] = torch.clamp(self.commands[env_ids, 1], self.command_ranges["lin_vel_y"][0], self.command_ranges["lin_vel_y"][1])
+        self.commands[env_ids, 2] = torch.clamp(self.commands[env_ids, 2], self.command_ranges["ang_vel_yaw"][0], self.command_ranges["ang_vel_yaw"][1])
+        if self.use_5d_base_command:
+            self.commands[env_ids, 3] = torch.clamp(self.commands[env_ids, 3], self.command_ranges["base_pitch"][0], self.command_ranges["base_pitch"][1])
+            self.commands[env_ids, 4] = torch.clamp(self.commands[env_ids, 4], self.command_ranges["base_height"][0], self.command_ranges["base_height"][1])
 
     def _step_contact_targets(self):
         if self.cfg.env.observe_gait_commands:
@@ -1088,9 +1238,9 @@ class ManipLoco(LeggedRobot):
         noise_vec[idx:idx+4] = 0  # Assuming no noise for foot contacts
         idx += 4
 
-        # Commands (dim 3)
-        noise_vec[idx:idx+3] = 0  # Assuming no noise for commands
-        idx += 3
+        # Commands (dim 3 or 5)
+        noise_vec[idx:idx+self.command_obs_dim] = 0  # Assuming no noise for commands
+        idx += self.command_obs_dim
 
         # End-effector goal position (dim 3)
         noise_vec[idx:idx+3] = 0  # Assuming no noise for end-effector goal position
@@ -1100,10 +1250,69 @@ class ManipLoco(LeggedRobot):
         noise_vec[idx:idx+3] = 0  # Assuming no noise for end-effector goal orientation
         idx += 3
 
+        if self.use_arm_base_message:
+            noise_vec[idx:idx+5] = 0
+            idx += 5
+
         if self.cfg.terrain.measure_heights:
             noise_vec[48:235] = noise_scales.height_measurements* noise_level * self.obs_scales.height_measurements
 
         return noise_vec
+
+    def _clip_arm_delta_action(self, arm_delta_action):
+        clipped = arm_delta_action.clone()
+        clipped[:, :3] = clipped[:, :3].clamp(
+            -self.cfg.multi_agent.max_ee_pos_delta,
+            self.cfg.multi_agent.max_ee_pos_delta,
+        )
+        clipped[:, 3:] = clipped[:, 3:].clamp(
+            -self.cfg.multi_agent.max_ee_rot_delta,
+            self.cfg.multi_agent.max_ee_rot_delta,
+        )
+        return clipped
+
+    def get_arm_jacobian(self, refresh=True):
+        """
+        Returns:
+            J_arm: Tensor[num_envs, 6, 6]
+        """
+        if refresh:
+            self.gym.refresh_jacobian_tensors(self.sim)
+        j_ee = self.jacobian_whole[:, self.ee_body_idx, :6, :]
+        j_arm = j_ee.index_select(-1, self.arm_dof_indices_tensor)
+        assert j_arm.shape == (self.num_envs, 6, 6), j_arm.shape
+        assert torch.isfinite(j_arm).all()
+        self.ee_j_eef = j_arm
+        return j_arm
+
+    def set_previous_arm_action_chunk(self, arm_action_chunk):
+        """Set the latest high-level arm chunk for message passing.
+
+        Existing low-level training does not produce chunks, so buffers stay at
+        zero until a high-level wrapper calls this method.
+        """
+        if arm_action_chunk.shape != self.prev_arm_action_chunk.shape:
+            raise ValueError(
+                f"Expected arm_action_chunk shape {self.prev_arm_action_chunk.shape}, got {arm_action_chunk.shape}"
+            )
+        self.prev_arm_action_chunk[:] = arm_action_chunk.to(self.device)
+
+    def _update_multi_agent_messages(self, ee_delta_pos):
+        assert ee_delta_pos.shape == (self.num_envs, 3), ee_delta_pos.shape
+        current_ee_delta_chunk = torch.zeros(
+            self.num_envs,
+            1,
+            6,
+            device=self.device,
+            dtype=ee_delta_pos.dtype,
+        )
+        current_ee_delta_chunk[:, 0, :3] = ee_delta_pos
+        self.m_a2b[:] = MultiAgentMessageBuilder.compute_m_a2b(
+            arm_action_chunk=current_ee_delta_chunk,
+            arm_jacobian=self.get_arm_jacobian(),
+        )
+        assert self.m_a2b.shape == (self.num_envs, 5), self.m_a2b.shape
+        assert torch.isfinite(self.m_a2b).all()
     
     def _reindex_feet(self, vec):
         # raisim_order = ["FR_foot", "FL_foot", "RR_foot", "RL_foot"]
@@ -1192,6 +1401,7 @@ class ManipLoco(LeggedRobot):
 
     def _control_ik(self, dpose):
         # solve damped least squares
+        self.ee_j_eef = self.get_arm_jacobian(refresh=False)
         j_eef_T = torch.transpose(self.ee_j_eef, 1, 2)
         lmbda = torch.eye(6, device=self.device) * (0.05 ** 2)
         A = torch.bmm(self.ee_j_eef, j_eef_T) + lmbda[None, ...]
@@ -1281,8 +1491,7 @@ class ManipLoco(LeggedRobot):
         
         if len(resample_id) > 0 and self.stop_update_goal:
             # set these env commands as 0
-            self.commands[resample_id, 0] = 0
-            self.commands[resample_id, 2] = 0
+            self.commands[resample_id, :3] = 0
 
         self._resample_ee_goal(resample_id)
     

@@ -12,7 +12,7 @@ The environment related code is `legged_gym/legged_gym/envs/manip_loco/manip_loc
 ```bash
 cd legged_gym/scripts
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-python train.py --headless --exptid SOME_YOUR_DESCRIPTION --proj_name b1z1-low --task b1z1 --sim_device cuda:1 --rl_device cuda:1 --observe_gait_commands
+python train.py --headless --exptid MARL_b1_z1 --proj_name b1z1-low --task b1z1 --sim_device cuda:1 --rl_device cuda:1 --observe_gait_commands
 ```
 - `--debug` disables wandb and set a small number of envs for faster execution.
 - `--headless` disables rendering, typically used when you train model.
@@ -25,7 +25,7 @@ Check `legged_gym/legged_gym/utils/helpers.py` for all command line args.
 Only need to specify `--exptid`. The parser will automatically find corresponding runs.
 ```bash
 cd legged_gym/scripts
-python play.py --exptid SOME_YOUR_DESCRIPTION --task b1z1 --proj_name b1z1-low --checkpoint 64000 --observe_gait_commands
+python play.py --exptid MARL_b1_z1_5D_base_command --task b1z1 --proj_name b1z1-low --checkpoint 45000 --sim_device cuda:1 --rl_device cuda:1 --observe_gait_commands
 ```
 Use `--sim_device cpu --rl_device cpu` in case not enough GPU memory.
 

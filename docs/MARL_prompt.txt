@@ -1,0 +1,770 @@
+你现在在一个机器人强化学习 / 模仿学习代码仓库中工作。请你仔细阅读现有代码结构，然后按照下面的目标进行模型结构改造和训练策略准备。
+现有的low-level训练请看/home/xqq/visual_wholebody/low-level/README.md。使用的conda环境是：dqwbc,
+执行运行程序之前，需要执行：export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH 。
+
+我的任务是：四足机器人 + 机械臂 + 夹爪对运动物体进行动态抓取。现在希望把底层策略改造成显式多智能体协调结构，包括：
+
+1. Base locomotion agent
+2. Arm manipulation agent，使用 IK-based controller
+3. Gripper interaction agent
+4. Agent 之间通过显式 message passing 进行协调
+
+请不要做大规模无关重构。优先保持现有训练入口、环境接口、配置系统、日志系统、checkpoint 逻辑不被破坏。所有修改都要尽量模块化、可回退、可通过 config 开关启用。
+
+---
+
+# 0. 先做代码库检查
+
+请先完成以下检查，然后再改代码：
+
+1. 找到当前 policy / actor-critic / model 网络定义位置。
+2. 找到当前 observation 构造位置。
+3. 找到当前 action 输出维度定义位置。
+4. 找到当前 base command、arm command、gripper command 是否已经存在。
+5. 找到当前训练入口、PPO / RL runner / config 文件。
+6. 找到是否已有 IK controller、PD controller、Jacobian / FK / robot kinematics 相关代码。
+
+请先输出你识别到的关键文件和类名，然后再开始修改。
+
+---
+
+# 1. 目标底层策略结构
+
+需要实现以下结构：
+
+## 1.1 Base locomotion agent
+
+输入：
+
+```python
+obs_base = [
+    robot_state,
+    base_command,
+    m_a2b
+]
+```
+
+其中：
+
+```python
+base_command = [
+    v_x,
+    v_y,
+    yaw_rate,
+    pitch,
+    base_height
+]
+```
+
+`m_a2b` 是 arm 到 base 的显式协调消息，定义见后面。
+
+Base locomotion agent 输出腿部关节 target position，然后通过已有 PD controller 转成 torque。如果现有代码已经是这种结构，请尽量复用。
+
+---
+
+## 1.2 Arm manipulation agent: IK-based controller
+
+Arm agent 不需要先做神经网络训练，它是一个 IK-based controller。
+
+输入：
+
+```python
+action_chunk
+h
+```
+
+其中：
+
+```python
+action_chunk = Δx_{t:t+H}^{ee,b}
+             = { (Δp_{t,k}^{ee,b}, Δr_{t,k}^{ee,b}) }_{k=1}^{H}
+```
+
+也就是说，action chunk 是一段未来末端位姿增量序列。
+
+每个 step 的 arm action 维度是 6：
+
+```python
+Δx_ee = [
+    Δp_x,
+    Δp_y,
+    Δp_z,
+    Δr_roll,
+    Δr_pitch,
+    Δr_yaw
+]
+```
+
+`h ∈ {1, 2, 3}` 表示每次高层输出 action chunk 之后，底层实际执行多少个 chunk step，再重新请求高层输出。
+
+请实现：
+
+```python
+ArmIKController
+```
+
+其功能：
+
+1. 接收当前 ee pose。
+2. 接收 action_chunk。
+3. 根据 h 依次执行前 h 个 chunk step。
+4. 对每个目标 ee pose 使用 IK 求解 arm joint target。
+5. 加入 joint limit clipping / safety clipping。
+6. 返回 arm joint target。
+7. 如果仓库已有 IK，请复用已有 IK；如果没有，请实现一个接口类，并明确 TODO，不要写死某个机器人模型。
+
+建议 IK 优化目标形式：
+
+```python
+min_q || FK(q) - x_target ||^2
+    + λ_smooth || q - q_prev ||^2
+    + λ_limit joint_limit_penalty(q)
+    - λ_manip * manipulability(q)
+```
+
+如果当前工程短期只支持已有 IK，那么先实现可运行版本，不要强行完整实现复杂 IK。
+
+---
+
+## 1.3 Gripper interaction agent
+
+输入：
+
+```python
+obs_gripper = [
+    grasp_intent,
+    m_a2g
+]
+```
+
+其中：
+
+```python
+grasp_intent ∈ {0, 1}
+```
+
+表示高层是否进入抓取阶段。
+
+输出：
+
+```python
+gripper_command ∈ {0, 1}
+```
+
+含义：
+
+```python
+0 = open
+1 = close
+```
+
+请实现两个版本：
+
+### 版本 A：rule-based gripper，作为默认可运行版本
+
+规则：
+
+```python
+close = (
+    grasp_intent > 0.5
+    and rho_align > rho_threshold
+    and terminal_ee_motion < terminal_motion_threshold
+)
+```
+
+否则 open。
+
+### 版本 B：learnable gripper policy，可选
+
+如果配置中启用：
+
+```yaml
+use_learnable_gripper: true
+```
+
+则使用一个小 MLP：
+
+```python
+GripperPolicyMLP(obs_dim=3, hidden_dim=64, output_dim=1)
+```
+
+输入：
+
+```python
+[
+    grasp_intent,
+    rho_align,
+    terminal_ee_motion
+]
+```
+
+输出 close logit。
+
+---
+
+# 2. 显式消息传递 Message Passing
+
+请新增一个模块，例如：
+
+```python
+message_passing.py
+```
+
+或者放在现有 model / utils 目录中，命名为：
+
+```python
+MultiAgentMessageBuilder
+```
+
+它负责计算：
+
+```python
+m_a2b
+m_a2g
+```
+
+---
+
+## 2.1 arm -> base message: m_a2b
+
+定义：
+
+```python
+m_a2b = [
+    Δp_bar_ee,
+    A_ee,
+    eta_manip
+]
+```
+
+其中：
+
+### 机械臂未来短时间平均运动方向
+
+```python
+Δp_bar_ee = (1 / H) * sum_{k=1}^{H} Δp_{t,k}^{ee}
+```
+
+维度是 3。
+
+### 机械臂未来短时间动作幅度
+
+```python
+A_ee = sum_{k=1}^{H} || Δp_{t,k}^{ee} ||_2
+```
+
+维度是 1。
+
+### 当前机械臂可操作性指标
+
+```python
+eta_manip = sqrt(det(J_a @ J_a.T))
+```
+
+维度是 1。
+
+为了数值稳定，请实现成：
+
+```python
+JJT = J_a @ J_a.transpose(-1, -2)
+eta_manip = sqrt(clamp(det(JJT + eps * I), min=0.0))
+```
+
+如果 J 不是满秩，或者 det 数值不稳定，可以改用：
+
+```python
+eta_manip = sqrt(prod(clamp(singular_values(J_a), min=eps)))
+```
+
+请把这一点写清楚，并保证 batch 版本可运行。
+
+最终：
+
+```python
+m_a2b.shape == [B, 5]
+```
+
+其中 5 = 3 + 1 + 1。
+
+---
+
+## 2.2 arm -> gripper message: m_a2g
+
+定义：
+
+```python
+m_a2g = [
+    rho_align,
+    terminal_ee_motion
+]
+```
+
+其中：
+
+### arm-gripper 对齐评分
+
+```python
+rho_align = exp(- ||p_obj_w||_2^2 / sigma_p^2)
+```
+
+`p_obj_w` 表示物体相对于 wrist camera 的位置。
+
+### 末端当前动作幅度
+
+```python
+terminal_ee_motion = || Δp_{t,H}^{ee} ||_2
+```
+
+最终：
+
+```python
+m_a2g.shape == [B, 2]
+```
+
+---
+
+# 3. 高层策略输出结构
+
+请把高层策略输出改成结构化 action，而不是一个语义不清楚的 flat action。
+
+高层输出应包括：
+
+```python
+high_level_action = {
+    "base_command": Tensor[B, 5],
+    "arm_action_chunk": Tensor[B, H, 6],
+    "grasp_intent": Tensor[B, 1],
+    "h_logits": Tensor[B, 3]   # 对应 h ∈ {1, 2, 3}
+}
+```
+
+其中：
+
+```python
+base_command = [v_x, v_y, yaw_rate, pitch, base_height]
+arm_action_chunk[..., :3] = Δp
+arm_action_chunk[..., 3:] = Δr
+grasp_intent = sigmoid(logit) or Bernoulli action
+h = categorical(h_logits) + 1
+```
+
+如果现有 RL 框架只能处理 flat action，请实现两个工具函数：
+
+```python
+flatten_high_level_action(action_dict) -> Tensor
+unflatten_high_level_action(action_tensor, H) -> dict
+```
+
+并保证原有 PPO log_prob / entropy / action scaling 逻辑仍然可用。
+
+请添加清晰的 action dimension 配置：
+
+```python
+base_command_dim = 5
+ee_delta_dim = 6
+chunk_horizon = H
+grasp_intent_dim = 1
+h_choice_dim = 3
+total_action_dim = 5 + H * 6 + 1 + 3
+```
+
+---
+
+# 4. 模型结构建议
+
+请实现或修改成如下结构：
+
+```python
+class MultiAgentHighLevelPolicy(nn.Module):
+    def __init__(...):
+        self.encoder = ...
+        self.shared_backbone = ...
+        self.base_head = ...
+        self.arm_chunk_head = ...
+        self.grasp_intent_head = ...
+        self.h_head = ...
+
+    def forward(obs):
+        feat = self.encoder(obs)
+        z = self.shared_backbone(feat)
+
+        base_command = self.base_head(z)
+        arm_action_chunk = self.arm_chunk_head(z).view(B, H, 6)
+        grasp_intent_logit = self.grasp_intent_head(z)
+        h_logits = self.h_head(z)
+
+        return {
+            "base_command": base_command,
+            "arm_action_chunk": arm_action_chunk,
+            "grasp_intent_logit": grasp_intent_logit,
+            "h_logits": h_logits
+        }
+```
+
+如果当前代码已经有 actor-critic，请不要完全推翻它。请把 actor head 改造成多头输出，critic 继续复用原有 value head。
+
+如果当前策略是 flat actor 输出，请至少做到：
+
+1. 内部多头输出；
+2. 最后 flatten 成原框架需要的 action；
+3. 在 env step 前 unflatten 回结构化 action。
+
+---
+
+# 5. Observation 改造
+
+需要在 observation 中加入 message passing 所需信息。
+
+请检查当前 env 是否可以提供：
+
+```python
+robot_state
+base_command
+current_ee_pose
+current_arm_joint_pos
+object_pos_wrist
+arm_jacobian
+previous_high_level_action
+```
+
+如果没有，请用最小方式补齐。
+
+新增 observation 项：
+
+```python
+obs["m_a2b"] = MultiAgentMessageBuilder.compute_m_a2b(
+    arm_action_chunk=previous_or_current_arm_action_chunk,
+    arm_jacobian=arm_jacobian
+)
+
+obs["m_a2g"] = MultiAgentMessageBuilder.compute_m_a2g(
+    arm_action_chunk=previous_or_current_arm_action_chunk,
+    object_pos_wrist=object_pos_wrist
+)
+```
+
+注意：
+
+* `m_a2b` 是给 base locomotion agent 用的。
+* `m_a2g` 是给 gripper interaction agent 用的。
+* 如果当前时刻还没有 action chunk，可以用全零 chunk 初始化。
+* 所有 message 都要支持 batch env。
+
+---
+
+# 6. 训练策略准备
+
+请不要直接端到端训练全部模块。请按照下面的阶段准备训练入口和配置。
+
+---
+
+## Stage 1: Base locomotion agent 训练
+
+目标：训练 base policy 跟踪 command，并学会利用 `m_a2b` 处理机械臂运动扰动。
+
+输入：
+
+```python
+robot_state + base_command + m_a2b
+```
+
+输出：
+
+```python
+leg_joint_target
+```
+
+训练方法：
+
+```python
+PPO
+```
+
+奖励建议：
+
+```python
+r_base =
+    w_v * velocity_tracking
+  + w_yaw * yaw_tracking
+  + w_height * height_tracking
+  + w_pitch * pitch_tracking
+  - w_energy * torque_penalty
+  - w_smooth * action_smoothness_penalty
+  - w_slip * foot_slip_penalty
+  - w_fall * fall_penalty
+```
+
+额外加入 arm-base coordination reward：
+
+```python
+r_assist =
+    I(eta_manip < eta_threshold)
+    * I(A_ee > A_threshold)
+    * max(0, dot(v_base_xy, normalize(Δp_bar_ee_xy)))
+```
+
+含义：当机械臂接近奇异位形，并且未来动作幅度较大时，base 应该往有利于机械臂运动的方向移动。
+
+请添加 config 开关：
+
+```yaml
+use_arm_base_message: true
+use_assist_reward: true
+```
+
+---
+
+## Stage 2: Arm IK controller
+
+目标：不训练神经网络，只调 IK controller。
+
+请提供：
+
+```python
+scripts/test_arm_ik_controller.py
+```
+
+或者类似 smoke test，用随机 action chunk 测试：
+
+1. 输入 shape 正确；
+2. 输出 joint target shape 正确；
+3. 不超过 joint limits；
+4. 没有 NaN。
+
+---
+
+## Stage 3: Gripper interaction agent 训练
+
+默认先使用 rule-based gripper。
+
+同时准备可选 BC 训练脚本：
+
+```python
+train_gripper_bc.py
+```
+
+训练标签规则：
+
+```python
+label_close = (
+    grasp_intent > 0.5
+    and rho_align > rho_threshold
+    and terminal_ee_motion < terminal_motion_threshold
+)
+```
+
+损失：
+
+```python
+BCEWithLogitsLoss
+```
+
+输入：
+
+```python
+[
+    grasp_intent,
+    rho_align,
+    terminal_ee_motion
+]
+```
+
+输出：
+
+```python
+close_logit
+```
+
+---
+
+## Stage 4: High-level policy 训练
+
+目标：固定低层模块，训练高层输出：
+
+```python
+base_command
+arm_action_chunk
+grasp_intent
+h
+```
+
+建议先支持两种模式：
+
+### 4.1 Behavior Cloning 预训练
+
+如果有 teacher / scripted policy / expert trajectory，支持 BC：
+
+```python
+loss =
+    L_base_command
+  + L_arm_chunk
+  + L_grasp_intent
+  + L_h
+```
+
+其中：
+
+```python
+L_base_command = MSE
+L_arm_chunk = SmoothL1
+L_grasp_intent = BCEWithLogits
+L_h = CrossEntropy
+```
+
+### 4.2 PPO / RL 微调
+
+固定：
+
+```python
+base locomotion agent
+arm IK controller
+gripper agent
+```
+
+只训练 high-level policy。
+
+高层 reward：
+
+```python
+r_high =
+    w_success * grasp_success
+  - w_time * time_penalty
+  - w_dist * ||p_ee - p_obj||
+  - w_relvel * ||v_ee - v_obj||
+  - w_stability * base_instability
+  - w_smooth * ||a_t - a_{t-1}||
+```
+
+请在 config 中加入：
+
+```yaml
+train_stage: "base" | "gripper_bc" | "high_level_bc" | "high_level_rl" | "joint_finetune"
+freeze_base_policy: true
+freeze_gripper_policy: true
+freeze_high_level_policy: false
+```
+
+---
+
+## Stage 5: Joint finetune
+
+最后再做少量联合微调，不要默认启用。
+
+推荐顺序：
+
+1. freeze base locomotion，freeze arm IK，只微调 high-level + gripper。
+2. 必要时只解冻 base policy 的最后几层。
+3. 不要从零开始端到端训练所有模块。
+
+---
+
+# 7. 需要新增 / 修改的文件
+
+请根据实际代码结构决定路径，但建议新增类似文件：
+
+```text
+models/multi_agent_policy.py
+models/message_passing.py
+controllers/arm_ik_controller.py
+controllers/gripper_controller.py
+utils/action_codec.py
+configs/multi_agent.yaml
+scripts/test_message_passing.py
+scripts/test_arm_ik_controller.py
+scripts/train_gripper_bc.py
+docs/multi_agent_training_plan.md
+```
+
+如果项目已有对应目录，请放到已有目录中。
+
+---
+
+# 8. 单元测试 / Smoke Test
+
+请至少实现以下测试：
+
+## 8.1 message passing shape test
+
+```python
+B = 4
+H = 3
+arm_action_chunk = torch.randn(B, H, 6)
+arm_jacobian = torch.randn(B, 6, 6)
+object_pos_wrist = torch.randn(B, 3)
+
+m_a2b = builder.compute_m_a2b(arm_action_chunk, arm_jacobian)
+m_a2g = builder.compute_m_a2g(arm_action_chunk, object_pos_wrist)
+
+assert m_a2b.shape == (B, 5)
+assert m_a2g.shape == (B, 2)
+assert torch.isfinite(m_a2b).all()
+assert torch.isfinite(m_a2g).all()
+```
+
+## 8.2 action codec test
+
+```python
+action_dict -> flatten -> unflatten
+```
+
+要求：
+
+1. shape 不变；
+2. base_command、arm_action_chunk、grasp_intent、h_logits 能正确恢复。
+
+## 8.3 policy forward test
+
+随机 obs 输入，检查：
+
+```python
+base_command.shape == [B, 5]
+arm_action_chunk.shape == [B, H, 6]
+grasp_intent_logit.shape == [B, 1]
+h_logits.shape == [B, 3]
+```
+
+---
+
+# 9. 数值稳定与安全约束
+
+请注意：
+
+1. 所有 action 都要 clip 到合理范围。
+2. `eta_manip` 计算不能出现 NaN。
+3. `rho_align` 需要 clamp，避免 exp 溢出。
+4. arm action chunk 的位置增量和旋转增量需要分别设置最大值，例如：
+
+```yaml
+max_ee_pos_delta: 0.05
+max_ee_rot_delta: 0.2
+```
+
+5. base command 也要 clip：
+
+```yaml
+max_vx: 0.5
+max_vy: 0.3
+max_yaw_rate: 0.8
+min_base_height: 0.25
+max_base_height: 0.55
+max_pitch: 0.4
+```
+
+具体数值请根据当前项目已有配置调整，不要硬编码在模型里。
+
+---
+
+# 10. 输出要求
+
+完成修改后，请给我：
+
+1. 修改了哪些文件。
+2. 每个文件新增了什么功能。
+3. 当前 action dim 和 observation dim 如何计算。
+4. 如何运行 message passing smoke test。
+5. 如何运行 policy forward smoke test。
+6. 如何开启 multi-agent policy 配置。
+7. 当前还有哪些 TODO，例如真实 IK、真实 Jacobian、真实 object_pos_wrist 等。
+8. 不要删除原始训练流程；保留旧模型路径，新增 config 开关切换到新结构。
+
+请开始实现。

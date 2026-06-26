@@ -35,7 +35,8 @@ import isaacgym
 
 from legged_gym import LEGGED_GYM_ROOT_DIR, LEGGED_GYM_ENVS_DIR
 from legged_gym.envs import *
-from legged_gym.utils import get_args, task_registry
+from legged_gym.utils.helpers import get_args
+from legged_gym.utils.task_registry import task_registry
 import torch
 import wandb
 

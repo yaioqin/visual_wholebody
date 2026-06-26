@@ -76,7 +76,8 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
 
     class commands:
         curriculum = True
-        num_commands = 3
+        use_5d_base_command = True
+        num_commands = 5
         resampling_time = 3. # time before command are changed[s]
 
         lin_vel_x_schedule = [0, 0.5]
@@ -88,7 +89,10 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
 
         class ranges:
             lin_vel_x = [-0.8, 0.8] # min max [m/s]
+            lin_vel_y = [-0.3, 0.3] # min max [m/s]
             ang_vel_yaw = [-1.0, 1.0]    # min max [rad/s]
+            base_pitch = [-0.3, 0.3] # min max [rad]
+            base_height = [0.32, 0.45] # min max [m]
 
     class normalization:
         class obs_scales:
@@ -106,7 +110,8 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
         num_torques = 12 + 6
         action_delay = 3  # -1 for no delay
         num_gripper_joints = 1
-        num_proprio = 2 + 3 + 18 + 18 + 12 + 4 + 3 + 3 + 3 
+        base_num_proprio = 2 + 3 + 18 + 18 + 12 + 4 + 3 + 3 + 3
+        num_proprio = base_num_proprio
         num_priv = 5 + 1 + 12
         history_len = 10
         num_observations = num_proprio * (history_len+1) + num_priv
@@ -187,6 +192,59 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
         osc_kp = np.array([100, 100, 100, 30, 30, 30])
         osc_kd = 2 * (osc_kp ** 0.5)
 
+    class multi_agent:
+        enabled = False
+        train_stage = "base"  # current supported path: low-level base/arm PPO
+
+        use_arm_delta_action = True
+        allow_arm_policy_action = False
+        arm_chunk_horizon = 1
+        fixed_h = 1
+        disable_gripper = True
+        use_high_level_policy = False
+        use_multi_agent_policy = False
+        use_arm_base_message = True
+        use_assist_reward = False
+        use_learnable_gripper = False
+        debug_print_kinematics_names = False
+
+        freeze_base_policy = True
+        freeze_gripper_policy = True
+        freeze_high_level_policy = False
+
+        base_command_dim = 5
+        ee_delta_dim = 6
+        chunk_horizon = arm_chunk_horizon
+        grasp_intent_dim = 1
+        h_choice_dim = 3
+        total_action_dim = base_command_dim + chunk_horizon * ee_delta_dim + grasp_intent_dim + h_choice_dim
+
+        max_ee_pos_delta = 0.05
+        max_ee_rot_delta = 0.2
+        max_joint_delta = 0.25
+        max_vx = 0.5
+        max_vy = 0.3
+        max_yaw_rate = 0.8
+        min_base_height = 0.32
+        max_base_height = 0.45
+        max_pitch = 0.3
+
+        rho_threshold = 0.75
+        terminal_motion_threshold = 0.02
+        eta_threshold = 0.02
+        action_amplitude_threshold = 0.01
+        assist_reward_scale = 0.05
+
+        arm_dof_names = [
+            "z1_waist",
+            "z1_shoulder",
+            "z1_elbow",
+            "z1_wrist_angle",
+            "z1_forearm_roll",
+            "z1_wrist_rotate",
+        ]
+        ee_body_name = "ee_gripper_link"
+
     class domain_rand:
         observe_priv = True
         randomize_friction = True
@@ -213,6 +271,8 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
         only_positive_rewards = False # if true negative total rewards are clipped at zero (avoids early termination problems)
         tracking_sigma = 0.2  # tracking reward = exp(-error^2/sigma)
         tracking_ee_sigma = 1
+        tracking_pitch_sigma = 0.25
+        tracking_height_sigma = 0.04
         soft_dof_pos_limit = 1.  # percentage of urdf limits, values above this limit are penalized
         soft_dof_vel_limit = 1.
         soft_torque_limit = 0.4
@@ -269,7 +329,8 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
             orientation = 0.0
             orientation_walking = 0.0
             orientation_standing = 0.0
-            base_height = -5.0
+            # In 5D command mode, commanded height is tracked by tracking_base_height.
+            base_height = 0.0
             torques_walking = 0.0
             torques_standing = 0.0
             energy_square = 0.0
@@ -278,6 +339,9 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
             base_height_walking = 0.0
             base_height_standing = 0.0
             penalty_lin_vel_y = 0.
+            arm_base_assist = 0.0
+            tracking_base_pitch = 0.5
+            tracking_base_height = 1.0
 
         class arm_scales:
             arm_termination = None
@@ -359,6 +423,10 @@ class B1Z1RoughCfgPPO(LeggedRobotCfgPPO):
         critic_hidden_dims = [128]
         activation = 'elu' # can be elu, relu, selu, crelu, lrelu, tanh, sigmoid
         output_tanh = False
+        chunk_horizon = B1Z1RoughCfg.multi_agent.chunk_horizon
+        encoder_hidden_dims = []
+        head_hidden_dims = []
+        value_dim = 2
 
         leg_control_head_hidden_dims = [128, 128]
         arm_control_head_hidden_dims = [128, 128]

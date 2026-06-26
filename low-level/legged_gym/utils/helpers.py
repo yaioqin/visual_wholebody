@@ -39,6 +39,7 @@ from isaacgym import gymutil
 from legged_gym import LEGGED_GYM_ROOT_DIR, LEGGED_GYM_ENVS_DIR
 
 def class_to_dict(obj) -> dict:
+    # 把配置类对象递归转成 Python 字典。
     if not  hasattr(obj,"__dict__"):
         return obj
     result = {}
@@ -56,6 +57,7 @@ def class_to_dict(obj) -> dict:
     return result
 
 def update_class_from_dict(obj, dict):
+    # 把字典里的值写回配置类对象。
     for key, val in dict.items():
         attr = getattr(obj, key, None)
         if isinstance(attr, type):
@@ -65,6 +67,7 @@ def update_class_from_dict(obj, dict):
     return
 
 def set_seed(seed):
+    # 固定随机种子，让实验更可复现。
     if seed == -1:
         seed = np.random.randint(0, 10000)
     print("Setting seed: {}".format(seed))
@@ -77,6 +80,7 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 def parse_sim_params(args, cfg):
+    # 根据命令行参数和配置文件，生成 Isaac Gym 的仿真参数 SimParams
     # code from Isaac Gym Preview 2
     # initialize sim params
     sim_params = gymapi.SimParams()
@@ -136,6 +140,10 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
             env_cfg.terrain.num_cols = args.cols
         if args.observe_gait_commands:
             env_cfg.env.observe_gait_commands = True
+        if args.disable_5d_base_command and hasattr(env_cfg.commands, "use_5d_base_command"):
+            env_cfg.commands.use_5d_base_command = False
+        if args.disable_arm_base_message and hasattr(env_cfg, "multi_agent"):
+            env_cfg.multi_agent.use_arm_base_message = False
         if args.record_video:
             env_cfg.env.record_video = args.record_video
         if args.stand_by:
@@ -172,6 +180,8 @@ def get_args(test=False):
         {"name": "--checkpoint", "type": int,"default": "-1",  "help": "Saved model checkpoint number. If -1: will load the last checkpoint. Overrides config file if provided."},
         {"name": "--stop_update_goal", "action": "store_true", "help": "stop when update a new ee goal"},
         {"name": "--observe_gait_commands", "action": "store_true", "help": "if observe gait commands, ref to <walk these ways>"},
+        {"name": "--disable_5d_base_command", "action": "store_true", "default": False, "help": "Disable 5D base command observation for old checkpoints"},
+        {"name": "--disable_arm_base_message", "action": "store_true", "default": False, "help": "Disable arm-to-base message observation for old checkpoints"},
         
         {"name": "--exptid", "type": str,  "required": True if not test else False,  "help": "Experiment ID"},
         {"name": "--debug", "action": "store_true", "default": False, "help": "Disable wandb logging"},
@@ -209,6 +219,7 @@ def get_args(test=False):
         args.sim_device += f":{args.sim_device_id}"
     return args
 
+# 把训练好的 policy 导出成 TorchScript，方便部署 / 测试。
 def export_policy_as_jit(actor_critic, path):
     if hasattr(actor_critic, 'memory_a'):
         # assumes LSTM: TODO add GRU

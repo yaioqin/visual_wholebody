@@ -28,8 +28,31 @@
 #
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
-from .helpers import class_to_dict, get_load_path, get_args, export_policy_as_jit, set_seed, update_class_from_dict
-from .task_registry import task_registry
-from .logger import Logger
-from .math import *
-from .terrain import Terrain
+_HELPER_EXPORTS = {
+    "class_to_dict",
+    "get_load_path",
+    "get_args",
+    "export_policy_as_jit",
+    "set_seed",
+    "update_class_from_dict",
+}
+
+__all__ = list(_HELPER_EXPORTS) + ["task_registry", "Logger", "Terrain"]
+
+
+def __getattr__(name):
+    if name in _HELPER_EXPORTS:
+        from . import helpers
+
+        value = getattr(helpers, name)
+    elif name == "task_registry":
+        from .task_registry import task_registry as value
+    elif name == "Logger":
+        from .logger import Logger as value
+    elif name == "Terrain":
+        from .terrain import Terrain as value
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    globals()[name] = value
+    return value

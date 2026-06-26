@@ -228,6 +228,26 @@ class ManipLoco_rewards:
         # Penalize base height away from target
         base_height = torch.mean(self.env.root_states[:, 2].unsqueeze(1), dim=1)
         return torch.abs(base_height - self.env.cfg.rewards.base_height_target), base_height
+
+    def _reward_tracking_base_pitch(self):
+        current_pitch = self.env._get_body_orientation()[:, 1]
+        if getattr(self.env, "use_5d_base_command", False):
+            target_pitch = self.env.commands[:, 3]
+        else:
+            target_pitch = torch.zeros_like(current_pitch)
+        pitch_error = current_pitch - target_pitch
+        reward = torch.exp(-torch.square(pitch_error) / self.env.cfg.rewards.tracking_pitch_sigma)
+        return reward, torch.abs(pitch_error)
+
+    def _reward_tracking_base_height(self):
+        base_z = self.env.root_states[:, 2]
+        if getattr(self.env, "use_5d_base_command", False):
+            target_height = self.env.commands[:, 4]
+        else:
+            target_height = torch.ones_like(base_z) * self.env.cfg.rewards.base_height_target
+        height_error = base_z - target_height
+        reward = torch.exp(-torch.square(height_error) / self.env.cfg.rewards.tracking_height_sigma)
+        return reward, torch.abs(height_error)
     
     def _reward_orientation_walking(self):
         reward, metric = self.env._reward_orientation()
@@ -307,6 +327,25 @@ class ManipLoco_rewards:
         rot_indices = torch.abs(self.env.commands[:, 2]) > self.env.cfg.commands.ang_vel_yaw_clip
         rew[rot_indices] = 0.
         return rew, rew
+
+    def _reward_arm_base_assist(self):
+        multi_agent_cfg = getattr(self.env.cfg, "multi_agent", None)
+        enabled = bool(getattr(multi_agent_cfg, "use_assist_reward", False))
+        if not enabled or not hasattr(self.env, "m_a2b"):
+            zero = torch.zeros(self.env.num_envs, device=self.env.device)
+            return zero, zero
+
+        delta_p_bar_xy = self.env.m_a2b[:, :2]
+        action_amplitude = self.env.m_a2b[:, 3]
+        eta_manip = self.env.m_a2b[:, 4]
+        direction = delta_p_bar_xy / torch.clamp(torch.linalg.norm(delta_p_bar_xy, dim=-1, keepdim=True), min=1.0e-6)
+        assist = torch.sum(self.env.base_lin_vel[:, :2] * direction, dim=-1).clamp(min=0.0)
+        active = (
+            (eta_manip < getattr(multi_agent_cfg, "eta_threshold", 0.05))
+            & (action_amplitude > getattr(multi_agent_cfg, "action_amplitude_threshold", 0.02))
+        )
+        reward = assist * active.to(dtype=assist.dtype)
+        return reward, assist
     
     # -------------B1 Gait Control Rewards----------------
     def _reward_tracking_contacts_shaped_force(self):

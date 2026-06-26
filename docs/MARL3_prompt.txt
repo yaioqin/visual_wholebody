@@ -1,0 +1,9 @@
+请你检查当前 low-level PPO 训练中，后 6 维 arm_delta_action 是否有明确 reward 约束。重点检查：
+
+1. 是否有 end-effector tracking reward；
+2. 是否有 arm joint target tracking reward；
+3. 是否有 arm action smoothness penalty；
+4. 是否有 arm joint velocity / torque penalty；
+5. 是否有 arm joint limit / collision penalty。
+
+如果没有，请先不要让 arm_delta_action 自由训练，而是加一个开关 allow_arm_policy_action=false，让后 6 维保持 zero 或 scripted delta。等 arm reward 补齐后再打开。

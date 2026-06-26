@@ -60,6 +60,7 @@ class PPO:
                  min_policy_std=None,
                  dagger_update_freq=20,
                  priv_reg_coef_schedual = [0, 0, 0],
+                 only_train_leg=False,
                  ):
 
         self.device = device
@@ -76,7 +77,9 @@ class PPO:
         self.transition = RolloutStorage.Transition()
 
         # Adaptation
-        self.hist_encoder_optimizer = optim.Adam(self.actor_critic.actor.history_encoder.parameters(), lr=learning_rate)
+        history_encoder = getattr(self.actor_critic.actor, "history_encoder", None)
+        self.supports_dagger = history_encoder is not None
+        self.hist_encoder_optimizer = optim.Adam(history_encoder.parameters(), lr=learning_rate) if self.supports_dagger else None
         self.priv_reg_coef_schedual = priv_reg_coef_schedual
 
         # PPO parameters
@@ -89,13 +92,20 @@ class PPO:
         self.lam = lam
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
-        self.min_policy_std = torch.tensor(min_policy_std, device=self.device)
+        min_policy_std_tensor = torch.tensor(min_policy_std, device=self.device)
+        policy_std_shape = self.actor_critic.std.shape
+        if min_policy_std_tensor.numel() == 1:
+            min_policy_std_tensor = min_policy_std_tensor.repeat(*policy_std_shape)
+        elif min_policy_std_tensor.numel() != self.actor_critic.std.numel():
+            min_policy_std_tensor = min_policy_std_tensor.mean().repeat(*policy_std_shape)
+        self.min_policy_std = min_policy_std_tensor.reshape(policy_std_shape)
 
         self.mixing_schedule = mixing_schedule
         self.torque_supervision = torque_supervision
         self.torque_supervision_schedule = torque_supervision_schedule
         self.adaptive_arm_gains = adaptive_arm_gains
         self.counter = 0
+        self.only_train_leg = only_train_leg
 
         # adaptive arm gains
         if self.adaptive_arm_gains:
@@ -171,12 +181,16 @@ class PPO:
                 entropy_batch = self.actor_critic.entropy
 
                 # Adaptation module update
-                priv_latent_batch = self.actor_critic.actor.infer_priv_latent(obs_batch)
-                with torch.inference_mode():
-                    hist_latent_batch = self.actor_critic.actor.infer_hist_latent(obs_batch)
-                priv_reg_loss = (priv_latent_batch - hist_latent_batch.detach()).norm(p=2, dim=1).mean()
-                priv_reg_stage = min(max((self.counter - self.priv_reg_coef_schedual[2]), 0) / self.priv_reg_coef_schedual[3], 1)
-                priv_reg_coef = priv_reg_stage * (self.priv_reg_coef_schedual[1] - self.priv_reg_coef_schedual[0]) + self.priv_reg_coef_schedual[0]
+                if hasattr(self.actor_critic.actor, "infer_priv_latent") and hasattr(self.actor_critic.actor, "infer_hist_latent"):
+                    priv_latent_batch = self.actor_critic.actor.infer_priv_latent(obs_batch)
+                    with torch.inference_mode():
+                        hist_latent_batch = self.actor_critic.actor.infer_hist_latent(obs_batch)
+                    priv_reg_loss = (priv_latent_batch - hist_latent_batch.detach()).norm(p=2, dim=1).mean()
+                    priv_reg_stage = min(max((self.counter - self.priv_reg_coef_schedual[2]), 0) / self.priv_reg_coef_schedual[3], 1)
+                    priv_reg_coef = priv_reg_stage * (self.priv_reg_coef_schedual[1] - self.priv_reg_coef_schedual[0]) + self.priv_reg_coef_schedual[0]
+                else:
+                    priv_reg_loss = torch.zeros((), device=self.device)
+                    priv_reg_coef = 0.0
                 # priv_reg_loss = torch.zeros(1, device=self.device)
 
                 # KL
@@ -196,10 +210,8 @@ class PPO:
 
 
                 # Surrogate loss
-                only_train_leg = False
-
                 mixing_advantages_batch = torch.zeros_like(advantages_batch)
-                if only_train_leg == True:
+                if self.only_train_leg == True:
                     mixing_advantages_batch[..., 0] = advantages_batch[..., 0]
                     mixing_advantages_batch[..., 1] = advantages_batch[..., 1]
                 else:
@@ -209,7 +221,7 @@ class PPO:
                 surrogate = - mixing_advantages_batch * ratio
                 surrogate_clipped = - mixing_advantages_batch * torch.clamp(ratio, 1.0 - self.clip_param,
                                                                                 1.0 + self.clip_param)
-                if only_train_leg == True:
+                if self.only_train_leg == True:
                     surrogate_loss = torch.max(surrogate, surrogate_clipped)[:, 0].mean()
                 else:
                     surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
@@ -271,6 +283,10 @@ class PPO:
         return mean_value_loss, mean_surrogate_loss, mean_arm_torques_loss, value_mixing_ratio, torque_supervision_weight, mean_priv_reg_loss, priv_reg_coef
     
     def update_dagger(self):
+        if not self.supports_dagger:
+            self.storage.clear()
+            self.update_counter()
+            return 0.0
         mean_hist_latent_loss = 0
         if self.actor_critic.is_recurrent:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -330,4 +346,3 @@ class PPO:
         arm_torques = fixed_arm_p_gains * (target_arm_dof_pos + self.default_arm_dof_pos - current_arm_dof_pos) \
             - fixed_arm_d_gains * current_arm_dof_vel
         return arm_torques
-

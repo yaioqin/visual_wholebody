@@ -1,0 +1,525 @@
+请在上一版“只训练底层策略、不考虑夹爪、action chunk 数量为 1、h 固定为 1、Jacobian 使用 Isaac Gym”的开发目标中，进一步整合 `base_height` command 的范围控制。
+
+当前底层训练仍然只训练 low-level policy，不训练 high-level policy，不接入 gripper，不使用 27D high-level action wrapper。
+
+---
+
+# 新增重点：base command 从 3D 扩展为 5D
+
+请检查当前代码中的 `self.commands` 维度。
+
+如果当前 command 还是 3D：
+
+```python
+[v_x, v_y, yaw_rate]
+```
+
+请新增配置开关：
+
+```yaml
+use_5d_base_command: true
+```
+
+当 `use_5d_base_command = true` 时，base command 应扩展为 5D：
+
+```python
+base_command = [
+    v_x,
+    v_y,
+    yaw_rate,
+    base_pitch,
+    base_height
+]
+```
+
+当 `use_5d_base_command = false` 时，保持旧的 3D command 流程不变，保证旧训练兼容。
+
+---
+
+# 1. Config 中新增 command range
+
+请在 `b1z1_config.py` 或当前任务对应 config 中新增/修改：
+
+```python
+class commands:
+    if use_5d_base_command:
+        num_commands = 5
+    else:
+        num_commands = 3
+
+    class ranges:
+        lin_vel_x = [-0.5, 0.5]
+        lin_vel_y = [-0.3, 0.3]
+        ang_vel_yaw = [-0.8, 0.8]
+
+        # 新增
+        base_pitch = [-0.3, 0.3]
+        base_height = [0.32, 0.45]
+```
+
+注意：
+
+1. `base_height` 必须有明确范围。
+2. 不要把高度范围硬编码在 env 逻辑里，必须从 config 读取。
+3. 如果当前机器人默认站立高度不是这个范围，请根据当前代码中的默认 base height / init state 调整，但必须保守。
+4. 如果是 B1+Z1，建议先用：
+
+```python
+base_height = [0.32, 0.45]
+```
+
+5. 如果后续切到 B2+Z1，可以再改为：
+
+```python
+base_height = [0.35, 0.55]
+```
+
+当前先按 B1Z1 默认使用 `[0.32, 0.45]`。
+
+---
+
+# 2. Command resampling 中加入 base_pitch 和 base_height
+
+请找到当前 command 重采样函数，通常可能类似：
+
+```python
+_resample_commands()
+```
+
+或者在 `ManipLoco` 中某个 command sampling 逻辑里。
+
+当 `use_5d_base_command = true` 时，请采样：
+
+```python
+self.commands[:, 0] = torch_rand_float(
+    self.cfg.commands.ranges.lin_vel_x[0],
+    self.cfg.commands.ranges.lin_vel_x[1],
+    (len(env_ids), 1),
+    device=self.device
+).squeeze(1)
+
+self.commands[:, 1] = torch_rand_float(
+    self.cfg.commands.ranges.lin_vel_y[0],
+    self.cfg.commands.ranges.lin_vel_y[1],
+    (len(env_ids), 1),
+    device=self.device
+).squeeze(1)
+
+self.commands[:, 2] = torch_rand_float(
+    self.cfg.commands.ranges.ang_vel_yaw[0],
+    self.cfg.commands.ranges.ang_vel_yaw[1],
+    (len(env_ids), 1),
+    device=self.device
+).squeeze(1)
+
+self.commands[:, 3] = torch_rand_float(
+    self.cfg.commands.ranges.base_pitch[0],
+    self.cfg.commands.ranges.base_pitch[1],
+    (len(env_ids), 1),
+    device=self.device
+).squeeze(1)
+
+self.commands[:, 4] = torch_rand_float(
+    self.cfg.commands.ranges.base_height[0],
+    self.cfg.commands.ranges.base_height[1],
+    (len(env_ids), 1),
+    device=self.device
+).squeeze(1)
+```
+
+请根据当前项目实际的 `torch_rand_float` 调用方式修改，不要破坏现有逻辑。
+
+---
+
+# 3. 使用 command 前必须 clip
+
+在 command 采样后，或者每次使用 command 前，请添加安全 clip。
+
+当 `use_5d_base_command = true` 时：
+
+```python
+self.commands[:, 3] = torch.clamp(
+    self.commands[:, 3],
+    self.cfg.commands.ranges.base_pitch[0],
+    self.cfg.commands.ranges.base_pitch[1],
+)
+
+self.commands[:, 4] = torch.clamp(
+    self.commands[:, 4],
+    self.cfg.commands.ranges.base_height[0],
+    self.cfg.commands.ranges.base_height[1],
+)
+```
+
+目的：
+
+1. 防止 command 超出物理可行范围。
+2. 后续如果 high-level policy 输出 base command，也不会直接把机器人搞崩。
+3. 训练时保证 base height command 始终合法。
+
+---
+
+# 4. Observation 中使用 5D base command
+
+请检查 `ManipLoco.compute_observations()`。
+
+当前 observation 里如果只拼接了：
+
+```python
+self.commands[:, :3]
+```
+
+请修改为：
+
+```python
+if self.cfg.commands.use_5d_base_command:
+    command_obs = self.commands[:, :5]
+else:
+    command_obs = self.commands[:, :3]
+```
+
+然后把 `command_obs` 拼进 observation。
+
+如果同时启用：
+
+```yaml
+use_arm_base_message: true
+```
+
+则 observation 还需要额外 append `m_a2b`，维度为 5。
+
+因此 observation dim 的变化规则是：
+
+```python
+obs_dim = original_obs_dim
+
+if use_5d_base_command:
+    obs_dim += 2  # old command 3D -> new command 5D
+
+if use_arm_base_message:
+    obs_dim += 5  # m_a2b
+```
+
+请同步修改 config 中的：
+
+```python
+num_observations
+```
+
+并添加 runtime assert：
+
+```python
+assert self.obs_buf.shape[1] == self.cfg.env.num_observations, \
+    f"obs dim mismatch: got {self.obs_buf.shape[1]}, expected {self.cfg.env.num_observations}"
+```
+
+---
+
+# 5. Reward 中加入 base_height tracking
+
+当前只训练 low-level policy，所以这里不是 high-level reward，而是底层 command tracking reward。
+
+请在 reward 容器中新增可选 reward：
+
+```python
+reward_base_height_tracking
+```
+
+形式可以先用指数型 tracking：
+
+```python
+base_height_error = self.root_states[:, 2] - self.commands[:, 4]
+reward_base_height = torch.exp(
+    - torch.square(base_height_error) / self.cfg.rewards.tracking_height_sigma
+)
+```
+
+请在 config 中新增：
+
+```python
+tracking_height_sigma = 0.05
+```
+
+以及 reward scale，例如：
+
+```python
+base_height_tracking = 1.0
+```
+
+如果当前 reward 系统使用类似 `scales` 的结构，请加入对应 scale。
+
+注意：
+
+1. 只有 `use_5d_base_command = true` 时才计算这个 reward。
+2. 如果 `use_5d_base_command = false`，不要访问 `self.commands[:, 4]`，避免越界。
+3. `base_height` tracking 的 scale 不要过大，避免压制 locomotion velocity tracking。
+4. 如果当前代码已有 height tracking reward，请不要重复添加，而是改成跟踪 `self.commands[:, 4]`。
+
+---
+
+# 6. Reward 中加入 base_pitch tracking
+
+因为 5D command 中也包含：
+
+```python
+base_pitch
+```
+
+所以请检查当前是否已有 pitch tracking reward。
+
+如果已有，请确认它跟踪的是：
+
+```python
+self.commands[:, 3]
+```
+
+而不是固定 pitch target。
+
+如果没有，请新增可选 reward：
+
+```python
+reward_base_pitch_tracking
+```
+
+形式可以是：
+
+```python
+base_pitch = current_base_pitch
+pitch_error = base_pitch - self.commands[:, 3]
+reward_base_pitch = torch.exp(
+    - torch.square(pitch_error) / self.cfg.rewards.tracking_pitch_sigma
+)
+```
+
+config 中新增：
+
+```python
+tracking_pitch_sigma = 0.05
+```
+
+以及 reward scale，例如：
+
+```python
+base_pitch_tracking = 0.5
+```
+
+注意：
+
+1. 只有 `use_5d_base_command = true` 时才计算。
+2. 如果已有 pitch tracking reward，请复用现有姿态计算逻辑。
+3. 不要破坏旧 3D command 训练路径。
+
+---
+
+# 7. 与 arm-base message 的关系
+
+当前训练目标仍然是：
+
+```text
+ActorCritic outputs 18D action
+ManipLoco.step consumes 18D action
+
+actions[:, :12]  -> leg joint target
+actions[:, 12:18] -> one-step arm EE delta -> IK -> arm joint target
+```
+
+同时：
+
+```text
+H = 1
+h = 1
+gripper disabled
+high-level disabled
+```
+
+`m_a2b` 仍然只在：
+
+```yaml
+use_arm_base_message: true
+```
+
+时加入 observation。
+
+`m_a2b` 使用：
+
+```python
+self.last_arm_delta_action.view(num_envs, 1, 6)
+```
+
+和 Isaac Gym arm-only Jacobian：
+
+```python
+J_arm: [num_envs, 6, 6]
+```
+
+计算得到：
+
+```python
+m_a2b: [num_envs, 5]
+```
+
+注意：`base_height` command 和 `m_a2b` 是两个不同概念。
+
+最终 observation 中可能同时包含：
+
+```python
+command_obs: [num_envs, 5]
+m_a2b: [num_envs, 5]
+```
+
+---
+
+# 8. Config 推荐默认值
+
+当前简化实验的默认 config 建议为：
+
+```yaml
+use_high_level_policy: false
+disable_gripper: true
+
+use_arm_delta_action: true
+arm_chunk_horizon: 1
+fixed_h: 1
+
+use_5d_base_command: true
+use_arm_base_message: true
+
+max_ee_pos_delta: 0.05
+max_ee_rot_delta: 0.2
+
+command_ranges:
+  lin_vel_x: [-0.5, 0.5]
+  lin_vel_y: [-0.3, 0.3]
+  ang_vel_yaw: [-0.8, 0.8]
+  base_pitch: [-0.3, 0.3]
+  base_height: [0.32, 0.45]
+
+use_assist_reward: false
+assist_reward_scale: 0.05
+eta_threshold: 0.02
+A_threshold: 0.01
+```
+
+如果项目配置不是 yaml，而是 Python class config，请按项目原有风格写入。
+
+---
+
+# 9. 必须新增 / 修改 smoke tests
+
+请在上一版 smoke tests 基础上增加 command range 测试。
+
+## 9.1 command dimension test
+
+当：
+
+```python
+use_5d_base_command = true
+```
+
+检查：
+
+```python
+assert self.commands.shape[1] == 5
+```
+
+当：
+
+```python
+use_5d_base_command = false
+```
+
+检查：
+
+```python
+assert self.commands.shape[1] == 3
+```
+
+## 9.2 base_height range test
+
+resample command 后检查：
+
+```python
+assert torch.all(self.commands[:, 4] >= self.cfg.commands.ranges.base_height[0])
+assert torch.all(self.commands[:, 4] <= self.cfg.commands.ranges.base_height[1])
+```
+
+只在 `use_5d_base_command = true` 时执行。
+
+## 9.3 base_pitch range test
+
+resample command 后检查：
+
+```python
+assert torch.all(self.commands[:, 3] >= self.cfg.commands.ranges.base_pitch[0])
+assert torch.all(self.commands[:, 3] <= self.cfg.commands.ranges.base_pitch[1])
+```
+
+只在 `use_5d_base_command = true` 时执行。
+
+## 9.4 observation dim test
+
+当：
+
+```python
+use_5d_base_command = true
+use_arm_base_message = true
+```
+
+检查：
+
+```python
+obs_dim = original_obs_dim + 2 + 5
+```
+
+当：
+
+```python
+use_5d_base_command = true
+use_arm_base_message = false
+```
+
+检查：
+
+```python
+obs_dim = original_obs_dim + 2
+```
+
+当：
+
+```python
+use_5d_base_command = false
+use_arm_base_message = true
+```
+
+检查：
+
+```python
+obs_dim = original_obs_dim + 5
+```
+
+当两个都关闭时：
+
+```python
+obs_dim = original_obs_dim
+```
+
+---
+
+# 10. 完成后请输出
+
+修改完成后，请总结：
+
+1. 当前 `self.commands` 是 3D 还是 5D。
+2. `base_height` 的范围在哪里设置。
+3. `base_pitch` 的范围在哪里设置。
+4. command resampling 在哪里修改。
+5. command clip 在哪里执行。
+6. observation 中 command 现在拼接几维。
+7. `num_observations` 增加了多少。
+8. 是否新增了 height tracking reward。
+9. 是否新增了 pitch tracking reward。
+10. 如何切回旧的 3D command 流程。
+11. 如何运行 command range smoke test。
+12. 如何和上一版 `m_a2b + Isaac Gym Jacobian + 18D low-level action` 逻辑共同工作。
+
+请在不破坏原始 low-level PPO 训练流程的前提下实现。

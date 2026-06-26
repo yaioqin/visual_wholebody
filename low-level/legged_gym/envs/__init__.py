@@ -34,5 +34,6 @@ from .manip_loco.b1z1_config import B1Z1RoughCfg, B1Z1RoughCfgPPO
 import os
 
 from legged_gym.utils.task_registry import task_registry
-
+                    # 任务名字          # 环境配置
 task_registry.register( "b1z1", ManipLoco, B1Z1RoughCfg(), B1Z1RoughCfgPPO(), 'b1z1')
+                            # 环境类                        # PPO训练配置       # 任务路径/标识

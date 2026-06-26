@@ -31,3 +31,8 @@
 from .actor_critic import ActorCritic
 from .actor_critic_recurrent import ActorCriticRecurrent
 from .actor_critic_hrl import ActorCriticHRL
+
+try:
+    from legged_gym.models.multi_agent_policy import MultiAgentActorCritic
+except ImportError:
+    MultiAgentActorCritic = None
