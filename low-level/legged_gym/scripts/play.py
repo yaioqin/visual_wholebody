@@ -36,6 +36,7 @@ from legged_gym.envs import *
 from legged_gym.utils.helpers import get_args, export_policy_as_jit, get_load_path
 from legged_gym.utils.task_registry import task_registry
 from legged_gym.utils.logger import Logger
+from legged_gym.utils.coordination_metrics import CoordinationMetrics
 
 import numpy as np
 import torch
@@ -43,6 +44,39 @@ import time
 import sys
 
 np.set_printoptions(precision=3, suppress=True)
+
+def _format_eval_value(value):
+    if isinstance(value, float):
+        if np.isnan(value):
+            return "nan"
+        return f"{value:.6g}"
+    return value
+
+def _print_coordination_summary(summary):
+    keys = [
+        "meta/num_envs",
+        "meta/eval_steps",
+        "vel/vx_mae",
+        "vel/yaw_mae",
+        "ee/pos_mean",
+        "ee/ori_geodesic_mean",
+        "ee/success_rate_step",
+        "stability/survival_rate_step",
+        "stability/base_ang_acc_rms",
+        "energy/total_power_abs_mean",
+        "smoothness/arm_action_rate_mean",
+        "coordination/base_ang_acc_when_arm_large",
+        "workspace/solvability_rate",
+        "workspace/hull_volume",
+    ]
+    print("========== Coordination Evaluation ==========")
+    for key in keys:
+        print(f"{key}: {_format_eval_value(summary.get(key, float('nan')))}")
+    warnings = []
+    warnings.extend(summary.get("metrics/warnings", []))
+    warnings.extend(summary.get("metrics/skipped", []))
+    print(f"warnings: {'; '.join(warnings) if warnings else 'none'}")
+    print("=============================================")
 
 def play(args):
     log_pth = LEGGED_GYM_ROOT_DIR + "/logs/{}/".format(args.proj_name) + args.exptid
@@ -118,9 +152,29 @@ def play(args):
         traj_length = 1000*int(env.max_episode_length)
     else:
         traj_length = int(env.max_episode_length)
+    if args.eval_coordination and args.eval_steps is not None:
+        traj_length = int(args.eval_steps) + max(0, int(args.eval_warmup_steps))
 
     # env.update_command_curriculum()
     env.reset()
+    coordination_metrics = None
+    if args.eval_coordination:
+        coordination_metrics = CoordinationMetrics(
+            env=env,
+            cfg=env_cfg,
+            num_envs=env.num_envs,
+            device=env.device,
+            dt=env.dt,
+            warmup_steps=args.eval_warmup_steps,
+            success_pos_thr=args.ee_success_pos_thr,
+            success_ori_thr=args.ee_success_ori_thr,
+            fall_height_thr=args.fall_height_thr,
+            save_eval_traj=args.save_eval_traj,
+        )
+        if args.eval_perturb:
+            coordination_metrics.add_warning(
+                "Optional perturbation rollout is not implemented; running normal rollout evaluation."
+            )
     for i in range(traj_length):
         start_time = time.time()
         if args.use_jit:
@@ -128,6 +182,8 @@ def play(args):
         else:
             actions = policy(obs.detach(), hist_encoding=True)
         obs, _, rews, arm_rews, dones, infos = env.step(actions.detach())
+        if coordination_metrics is not None:
+            coordination_metrics.update(env, actions.detach(), obs)
         if args.record_video:
             imgs = env.render_record(mode='rgb_array')
             if imgs is not None:
@@ -142,6 +198,18 @@ def play(args):
     if args.record_video:
         for mp4_writer in mp4_writers:
             mp4_writer.close()
+    if coordination_metrics is not None:
+        summary = coordination_metrics.summarize()
+        out_dir = args.eval_out_dir
+        if out_dir is None:
+            out_dir = os.path.join(log_pth, "coordination_eval")
+        paths = coordination_metrics.save(out_dir)
+        _print_coordination_summary(summary)
+        print("Saved coordination evaluation to:")
+        print(f"  json: {paths['json']}")
+        print(f"  csv:  {paths['csv']}")
+        if paths["npz"] is not None:
+            print(f"  npz:  {paths['npz']}")
 
 if __name__ == '__main__':
     EXPORT_POLICY = False

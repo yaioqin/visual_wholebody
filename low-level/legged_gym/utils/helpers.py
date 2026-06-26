@@ -30,6 +30,7 @@
 
 import os
 import copy
+import math
 import torch
 import numpy as np
 import random
@@ -205,6 +206,18 @@ def get_args(test=False):
         {"name": "--flat_terrain", "action": "store_true", "default": False,  "help": "Flat the terrain"},
         {"name": "--pitch_control", "action": "store_true", "default": False,  "help": "Control Pitch"},
         {"name": "--vel_obs", "action": "store_true", "default": False,  "help": "Control Pitch"},
+        {"name": "--eval_coordination", "action": "store_true", "default": False, "help": "Enable play-time whole-body coordination evaluation"},
+        {"name": "--eval_steps", "type": int, "default": None, "help": "Number of non-warmup evaluation rollout steps"},
+        {"name": "--eval_warmup_steps", "type": int, "default": 100, "help": "Warmup rollout steps to exclude from coordination metrics"},
+        {"name": "--eval_out_dir", "type": str, "default": None, "help": "Directory for coordination evaluation json/csv/npz outputs"},
+        {"name": "--ee_success_pos_thr", "type": float, "default": 0.03, "help": "EE position success threshold in meters"},
+        {"name": "--ee_success_ori_thr", "type": float, "default": math.pi / 36, "help": "EE orientation success threshold in radians"},
+        {"name": "--fall_height_thr", "type": float, "default": 0.26, "help": "Base height fall threshold in meters"},
+        {"name": "--save_eval_traj", "action": "store_true", "default": False, "help": "Save per-step coordination evaluation trajectories"},
+        {"name": "--eval_perturb", "action": "store_true", "default": False, "help": "Reserved flag for optional perturbation evaluation"},
+        {"name": "--perturb_force_min", "type": float, "default": 10.0, "help": "Minimum perturbation force in Newtons"},
+        {"name": "--perturb_force_max", "type": float, "default": 20.0, "help": "Maximum perturbation force in Newtons"},
+        {"name": "--perturb_duration", "type": float, "default": 2.0, "help": "Perturbation duration in seconds"},
         
         {"name": "--rows", "type": int, "help": "num_rows."},
         {"name": "--cols", "type": int, "help": "num_cols"},
