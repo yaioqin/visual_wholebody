@@ -1,0 +1,871 @@
+当前问题：
+low-level/legged_gym/scripts/play.py 目前只能播放 policy，没有在 play 阶段评估 quadruped + arm whole-body coordination 的代码。请你直接实现一套 play-time evaluation metrics，不要改训练逻辑，只在 policy rollout 时统计指标。
+
+重要背景：
+这个项目是四足机器人 + 机械臂的 loco-manipulation / whole-body control。我要评估的不是单纯 locomotion，也不是单纯 arm tracking，而是 base、leg、arm、end-effector 是否协调。
+
+
+============================================================
+一、指标来源和定义说明
+============================================================
+
+我希望你参考两类 whole-body loco-manipulation 论文中的评估方式。
+
+------------------------------------------------------------
+1. RoboDuet 类指标
+------------------------------------------------------------
+
+RoboDuet 评估 whole-body legged loco-manipulation 时，主要使用以下指标：
+
+A. Velocity Tracking Error
+定义：
+机器人实际 base velocity 和 command velocity 之间的误差。
+
+需要评估：
+- vx tracking error
+- vy tracking error
+- yaw angular velocity tracking error
+
+公式：
+vx_err = abs(actual_vx - command_vx)
+vy_err = abs(actual_vy - command_vy)
+yaw_err = abs(actual_yaw_rate - command_yaw_rate)
+
+其中：
+- actual_vx, actual_vy 来自 base frame 下的 base linear velocity
+- actual_yaw_rate 来自 base frame 下的 base angular velocity z 分量
+- command_vx, command_vy, command_yaw_rate 来自 env.commands
+
+输出：
+- MAE
+- RMSE
+- max error
+
+B. End-Effector Position Tracking Error
+RoboDuet 使用 spherical coordinate 表达 EE target position，包括：
+- l: radius，末端目标距离
+- p: pitch / latitude
+- y: yaw / longitude
+并且还统计 Euclidean distance D。
+
+在当前仓库中不一定使用 l,p,y 表示，因此请优先实现更通用的 3D Cartesian position error：
+
+ee_pos_err = || actual_ee_pos - target_ee_pos ||_2
+
+如果仓库中能找到 spherical command，则额外统计：
+l_err, p_err, y_err。
+
+输出：
+- ee/pos_mean
+- ee/pos_rmse
+- ee/pos_median
+- ee/pos_p90
+- ee/pos_max
+
+C. End-Effector Orientation Tracking Error
+RoboDuet 使用 orientation tracking error，包括：
+- alpha, beta, gamma 三个角度误差
+- quaternion geodesic distance ζ
+
+请优先实现 quaternion geodesic distance：
+
+给定实际末端四元数 q_actual 和目标四元数 q_target：
+
+dot = abs(sum(q_actual * q_target))
+dot = clamp(dot, -1, 1)
+theta = 2 * acos(dot)
+
+theta 即 orientation error，单位 rad。
+
+注意：
+- 需要兼容 xyzw 和 wxyz 两种 quaternion 顺序。
+- 优先检查仓库已有 quat 工具函数，例如 isaacgym.torch_utils 或 legged_gym 内部 quat 工具。
+- 如果只有 rpy，没有 quaternion，则使用 wrapped angle error：
+  angle_err = atan2(sin(actual - target), cos(actual - target))
+
+输出：
+- ee/ori_geodesic_mean
+- ee/ori_geodesic_rmse
+- ee/ori_geodesic_median
+- ee/ori_geodesic_p90
+- ee/ori_geodesic_max
+
+D. Pose Success Rate
+RoboDuet 认为一个 EE pose tracking sample 成功，需要同时满足：
+
+1. 末端位置误差：
+   D <= 0.03 m
+
+2. 末端姿态误差：
+   theta <= pi / 36
+
+这里 theta 是 orientation error，约等于 5 degree。
+
+3. 机器人没有摔倒。
+4. 没有 reset。
+5. 如果有 self-collision / unsafe collision flag，则不能发生碰撞。
+
+请实现：
+success = (ee_pos_err <= 0.03) & (ee_ori_err <= pi/36) & alive_mask
+
+输出：
+- ee/success_rate_step
+- ee/success_rate_episode
+- ee/time_to_success_mean
+- ee/time_to_success_median
+
+如果 play.py 中目标是连续 tracking，不是单目标 reaching，则统计所有 step 的 success rate。
+如果可以识别 episode，则统计 episode 内是否曾经达到 success。
+
+E. Survival Rate
+RoboDuet 的 survival rate 是在扰动下统计机器人是否保持站立。论文中使用 10N 到 20N 的随机外力施加到 base 上持续 2 秒，然后看机器人是否保持 base height > 0.26 m。
+
+当前 play 阶段可以先不强制实现外力扰动，但至少实现普通 rollout 下的 survival rate：
+
+fall 条件：
+- base_height < termination height
+- 如果 cfg 里有 termination_height，优先使用 cfg
+- 否则默认 fall_height_thr = 0.26
+- 或者 env.reset_buf == 1 / env.termination_buf == 1
+
+输出：
+- stability/survival_rate_step
+- stability/fall_rate_step
+- stability/episode_survival_rate
+- stability/base_height_mean
+- stability/base_height_min
+- stability/base_height_p05
+
+如果仓库中方便施加外力，可以额外实现 optional perturbation eval：
+--eval_perturb
+--perturb_force_min 10
+--perturb_force_max 20
+--perturb_duration 2.0
+
+但这个不是第一优先级，不能影响普通 eval。
+
+F. Solvability
+RoboDuet 中 solvability 定义为：
+
+solvability = collision-free reachable poses / total sampled poses
+
+含义：
+目标 EE pose 从当前 pose 出发，在 tracking 过程中能够达到，并且不发生碰撞，则认为该 sample solvable。
+
+在 play 阶段近似实现：
+如果一个 target 在限定时间内满足：
+- ee_pos_err <= 0.03
+- ee_ori_err <= pi/36
+- no fall
+- no reset
+- no self-collision / unsafe collision if available
+
+则该 target 是 solvable。
+
+输出：
+- workspace/solvability_rate
+
+如果 play.py 里没有明确 target 分段，则把每个 episode 作为一个 sample，或者把连续 tracking 中每个 env 的 target command 当作 sample。
+
+G. Workspace
+RoboDuet 中 workspace 是：
+在 tracking error threshold 内成功达到、并且 tracking 过程中没有 self-collision 的目标命令点形成的 convex hull 面积/体积。
+
+请实现近似版本：
+收集所有 success 时刻的 target_ee_pos 或 actual_ee_pos。
+如果点数足够：
+- 3D convex hull volume: workspace/hull_volume
+- x-z 平面 convex hull area: workspace/hull_area_xz
+- x-y 平面 convex hull area: workspace/hull_area_xy
+
+使用 scipy.spatial.ConvexHull。
+如果 scipy 不存在，不要强制安装，跳过该指标并 warning。
+
+输出：
+- workspace/success_points
+- workspace/hull_volume
+- workspace/hull_area_xz
+- workspace/hull_area_xy
+
+------------------------------------------------------------
+2. Deep Whole-Body Control 类指标
+------------------------------------------------------------
+
+Deep Whole-Body Control 主要评估 unified whole-body policy 相比 separate policy / uncoordinated policy 是否更协调。它报告的核心指标包括：
+
+A. Survival Percentage
+含义：
+episode 内机器人保持稳定、不摔倒、不提前 reset 的比例。
+
+这和上面的 survival rate 一致。
+
+B. Base Acceleration
+论文中使用 base angular acceleration 评估底盘是否稳定。base acceleration 越小，说明机械臂运动没有让底盘产生剧烈晃动。
+
+实现：
+base_ang_acc = (base_ang_vel_t - base_ang_vel_t_minus_1) / dt
+
+如果有 base linear velocity，也统计：
+base_lin_acc = (base_lin_vel_t - base_lin_vel_t_minus_1) / dt
+
+输出：
+- stability/base_ang_acc_mean
+- stability/base_ang_acc_rms
+- stability/base_ang_acc_p90
+- stability/base_lin_acc_mean
+- stability/base_lin_acc_rms
+- stability/base_lin_acc_p90
+
+C. Velocity Error
+论文中 velocity error 是 base velocity command 和 actual base velocity 的 L1 error。
+
+实现：
+vel_l1 = abs(vx - vx_cmd) + abs(yaw_rate - yaw_rate_cmd)
+
+如果有 vy command，则加入 vy：
+vel_l1 = abs(vx - vx_cmd) + abs(vy - vy_cmd) + abs(yaw_rate - yaw_rate_cmd)
+
+输出：
+- vel/l1_mean
+- vel/l1_rmse
+
+D. EE Error
+论文中 EE error 是 end-effector command 和 actual end-effector pose 的 L1 error。
+
+请实现：
+如果有 EE position：
+ee_pos_l1 = sum(abs(actual_ee_pos - target_ee_pos))
+
+如果有 EE orientation：
+ee_ori_error 使用 quaternion geodesic distance 或 rpy wrapped error。
+
+输出：
+- ee/l1_mean
+- ee/l1_rmse
+
+E. Total Energy
+论文中 total energy 是 legs + arm 的总能耗，且指标按 episode length 归一化。
+
+如果有 env.torques 和 env.dof_vel：
+
+power_abs = abs(torques * dof_vel)
+
+需要统计：
+- leg power
+- arm power
+- total power
+
+如果能区分 leg dof 和 arm dof：
+leg_energy = sum over leg joints and time of abs(tau * qdot) * dt
+arm_energy = sum over arm joints and time of abs(tau * qdot) * dt
+
+输出：
+- energy/leg_power_abs_mean
+- energy/arm_power_abs_mean
+- energy/total_power_abs_mean
+- energy/leg_energy_sum
+- energy/arm_energy_sum
+- energy/total_energy_sum
+- energy/total_energy_per_episode
+- energy/total_energy_per_step
+
+RoboDuet 的 leg energy reward 还使用了 squared power 形式：
+sum(|tau_i * qdot_i|^2)
+
+所以额外统计：
+- energy/leg_power_squared_mean
+- energy/arm_power_squared_mean
+- energy/total_power_squared_mean
+
+F. Arm Workspace
+Deep Whole-Body Control 用 1000 个 sampled EE poses 的 convex hull volume 估计 arm workspace。
+
+请实现和上面 workspace 类似的统计：
+- 收集成功 tracking 的 EE target 或 actual EE pose
+- 用 convex hull volume 表示 reachable workspace
+
+输出：
+- workspace/hull_volume
+
+G. Whole-Body Coordination Correlation
+Deep Whole-Body Control 的 real-world analysis 说明：
+- 当 EE command pitch p 改变时，quadruped body pitch 会随之改变，说明腿部通过调整身体俯仰帮助机械臂 reach。
+- 当 EE command yaw y 靠近机器人侧方时，quadruped body roll 会随之改变，说明腿部通过侧倾帮助机械臂 reach。
+- 当目标更远，即 radius / length l 更大时，base pitch 变化更明显。
+
+请把这个思想变成诊断性指标：
+
+如果能获取 target_ee_pos 或 ee command：
+- target_ee_x
+- target_ee_y
+- target_ee_z
+或者 spherical command：
+- l
+- p
+- y
+
+如果能获取 base orientation：
+- base_roll
+- base_pitch
+- base_yaw
+
+统计 Pearson correlation：
+- coordination/corr_target_ee_x_base_pitch
+- coordination/corr_target_ee_z_base_pitch
+- coordination/corr_target_ee_y_base_roll
+- coordination/corr_ee_pos_err_base_ang_acc
+- coordination/corr_arm_action_norm_base_ang_acc
+
+注意：
+这些 correlation 不是越大越好，而是 diagnostic metrics，用来判断是否存在 whole-body coupling。请在打印结果中标注 diagnostic。
+
+H. Stability Under Large Arm Motion
+为了评估 arm 大动作时 base 是否稳定，请实现：
+
+arm_action_delta = || arm_action_t - arm_action_t_minus_1 ||
+
+large_arm_motion_mask = arm_action_delta > percentile(arm_action_delta, 75)
+
+在 large arm motion 子集上统计：
+- base angular acceleration
+- base linear acceleration
+- EE position error
+- velocity tracking error
+- survival rate
+
+输出：
+- coordination/base_ang_acc_when_arm_large
+- coordination/base_lin_acc_when_arm_large
+- coordination/ee_pos_err_when_arm_large
+- coordination/vel_err_when_arm_large
+- coordination/survival_when_arm_large
+
+这个指标能反映机械臂大幅运动时，四足底盘有没有失稳。
+
+============================================================
+二、需要修改的代码结构
+============================================================
+
+请新增一个文件：
+
+low-level/legged_gym/utils/coordination_metrics.py
+
+实现：
+
+class CoordinationMetrics:
+    def __init__(
+        self,
+        env,
+        cfg=None,
+        num_envs=None,
+        device=None,
+        dt=None,
+        warmup_steps=0,
+        success_pos_thr=0.03,
+        success_ori_thr=math.pi / 36,
+        fall_height_thr=0.26,
+        save_eval_traj=False,
+    ):
+        ...
+
+    def reset(self):
+        ...
+
+    def update(self, env, actions, obs=None):
+        ...
+
+    def summarize(self):
+        return summary_dict
+
+    def save(self, out_dir, prefix="coordination_eval"):
+        save json and csv
+
+然后修改：
+
+low-level/legged_gym/scripts/play.py
+
+增加 CLI 参数：
+--eval_coordination
+--eval_steps int default None
+--eval_warmup_steps int default 100
+--eval_out_dir str default None
+--ee_success_pos_thr float default 0.03
+--ee_success_ori_thr float default pi/36
+--fall_height_thr float default 0.26
+--save_eval_traj
+--eval_perturb optional, default False
+
+play.py 逻辑：
+1. 正常创建 env 和 policy。
+2. 如果 args.eval_coordination:
+   metric = CoordinationMetrics(...)
+3. 在 rollout loop 中：
+   actions = policy(obs)
+   obs, _, rews, dones, infos = env.step(actions)
+   if args.eval_coordination:
+       metric.update(env, actions, obs)
+4. rollout 结束：
+   summary = metric.summarize()
+   metric.save(out_dir)
+   print summary
+
+要求：
+- 不改变训练。
+- 不改变 reward。
+- 不改变 policy 输入输出。
+- 不影响普通 play。
+- 只有传入 --eval_coordination 时才启用。
+- 所有指标尽量 GPU 累计，不要每步 CPU sync。
+- 不要每步 print。
+- 不要每步保存文件。
+
+============================================================
+三、必须实现的 helper function
+============================================================
+
+请在 coordination_metrics.py 中实现：
+
+1. safe_get_tensor(env, candidates)
+功能：
+从 env 中按候选变量名列表读取第一个存在且不是 None 的 tensor。
+
+例如：
+safe_get_tensor(env, [
+    "base_lin_vel",
+    "base_linear_velocity",
+    "base_vel",
+])
+
+如果都找不到，返回 None。
+
+2. safe_get_nested_attr(obj, path)
+支持：
+"cfg.env.termination_height"
+"env.root_states"
+
+3. quat_geodesic_distance(q1, q2, quat_order="auto")
+功能：
+计算 quaternion geodesic distance。
+需要兼容 xyzw / wxyz。
+如果 quat_order="auto"，请尽量根据仓库已有 convention 判断；无法判断时默认 Isaac Gym 常用 xyzw，并给 warning。
+
+公式：
+dot = abs(sum(q1 * q2, dim=-1))
+dot = clamp(dot, -1.0, 1.0)
+theta = 2 * acos(dot)
+
+返回：
+[num_envs] rad
+
+4. angle_wrap_error(a, b)
+公式：
+atan2(sin(a - b), cos(a - b))
+
+5. masked_mean(x, mask)
+如果 mask 为空，返回 nan tensor。
+
+6. pearson_corr(x, y)
+输入 1D tensor。
+如果样本数不足或 std 太小，返回 nan。
+
+7. RunningMetricAccumulator
+至少支持：
+- add(name, value, mask=None)
+- mean
+- rmse
+- min
+- max
+- count
+
+8. compute_convex_hull(points)
+功能：
+points: [N, 3]
+输出：
+- hull volume
+- hull area xy
+- hull area xz
+
+依赖 scipy optional：
+如果 scipy 不存在，返回 None 并记录 warning。
+
+============================================================
+四、env 变量自动适配
+============================================================
+
+当前仓库变量名可能不统一，所以必须写自动适配。
+
+1. base velocity
+候选变量名：
+- env.base_lin_vel
+- env.base_linear_velocity
+- env.base_vel
+
+base angular velocity：
+- env.base_ang_vel
+- env.base_angular_velocity
+
+commands：
+- env.commands
+- env.command
+- env.commands_scale
+
+常见 command index：
+- commands[:, 0] = vx_cmd
+- commands[:, 1] = vy_cmd
+- commands[:, 2] = yaw_rate_cmd
+
+如果当前仓库只使用 vx 和 yaw，没有 vy，要兼容。
+
+2. base height
+候选：
+- env.root_states[:, 2]
+- env.base_pos[:, 2]
+- env.base_position[:, 2]
+
+3. base orientation
+候选：
+- env.base_quat
+- env.root_states[:, 3:7]
+- env.base_rpy
+- env.roll, env.pitch, env.yaw
+
+如果只有 quaternion，需要转换成 roll, pitch, yaw。
+
+4. EE actual position
+候选：
+- env.ee_pos
+- env.ee_pos_world
+- env.ee_pos_local
+- env.curr_ee_pos
+- env.end_effector_pos
+- env.gripper_pos
+- env.rigid_body_states[:, ee_index, :3]
+
+5. EE target position
+候选：
+- env.ee_goal_pos
+- env.ee_target_pos
+- env.target_ee_pos
+- env.ee_goal
+- env.commands_ee
+- env.curr_ee_goal
+- env.goal_ee_pos
+
+6. EE actual orientation
+候选：
+- env.ee_quat
+- env.ee_quat_world
+- env.ee_rot
+- env.ee_rpy
+- env.end_effector_quat
+- env.gripper_quat
+
+7. EE target orientation
+候选：
+- env.ee_goal_quat
+- env.ee_target_quat
+- env.target_ee_quat
+- env.goal_ee_quat
+- env.commands_ee_quat
+
+8. torque / dof velocity
+候选：
+- env.torques
+- env.dof_vel
+- env.dof_pos
+
+9. actions
+传入 update(env, actions) 的 actions 是当前 policy output。
+上一帧 actions 请在 CoordinationMetrics 内部缓存。
+如果 env.last_actions 存在，也可以校验使用。
+
+10. reset / done / collision
+候选：
+- env.reset_buf
+- env.termination_buf
+- env.time_out_buf
+- env.collision_buf
+- env.self_collision_buf
+- env.contact_forces
+
+缺少 collision flag 时不要报错，只跳过 collision-based metrics。
+
+============================================================
+五、leg / arm dof index 自动判断
+============================================================
+
+请实现：
+
+def infer_leg_arm_indices(env, cfg):
+    ...
+
+优先级：
+1. 优先读取 env 中已有字段：
+   - env.leg_dof_indices
+   - env.arm_dof_indices
+   - env.feet_indices
+   - env.arm_indices
+
+2. 如果 env.dof_names 存在，按名字判断：
+   leg keywords:
+   - FL
+   - FR
+   - RL
+   - RR
+   - hip
+   - thigh
+   - calf
+
+   arm keywords:
+   - z1
+   - arm
+   - joint1
+   - joint2
+   - joint3
+   - joint4
+   - joint5
+   - joint6
+   - wrist
+   - gripper
+
+3. 如果都没有，则 fallback：
+   - leg_indices = torch.arange(0, 12)
+   - arm_indices = torch.arange(12, min(num_dof, 18))
+
+fallback 时必须 print warning，并在 summary 里写：
+metrics/warnings += "Using fallback leg/arm dof split: first 12 leg, next 6 arm."
+
+action index 判断同理：
+- 优先使用 env action mapping
+- fallback 为前 12 维 leg action，后 6 维 arm action
+
+============================================================
+六、具体指标输出字段
+============================================================
+
+请输出 summary dict，至少包含：
+
+基础信息：
+- meta/num_envs
+- meta/eval_steps
+- meta/warmup_steps
+- meta/dt
+- meta/total_samples
+
+Velocity:
+- vel/vx_mae
+- vel/vx_rmse
+- vel/vy_mae
+- vel/vy_rmse
+- vel/yaw_mae
+- vel/yaw_rmse
+- vel/l1_mean
+- vel/l1_rmse
+
+End-effector:
+- ee/pos_mean
+- ee/pos_rmse
+- ee/pos_median
+- ee/pos_p90
+- ee/pos_max
+- ee/ori_geodesic_mean
+- ee/ori_geodesic_rmse
+- ee/ori_geodesic_median
+- ee/ori_geodesic_p90
+- ee/ori_geodesic_max
+- ee/success_rate_step
+- ee/success_rate_episode
+- ee/time_to_success_mean
+- ee/time_to_success_median
+
+Stability:
+- stability/survival_rate_step
+- stability/fall_rate_step
+- stability/episode_survival_rate
+- stability/base_height_mean
+- stability/base_height_min
+- stability/base_height_p05
+- stability/base_ang_acc_mean
+- stability/base_ang_acc_rms
+- stability/base_ang_acc_p90
+- stability/base_lin_acc_mean
+- stability/base_lin_acc_rms
+- stability/base_lin_acc_p90
+
+Energy:
+- energy/leg_power_abs_mean
+- energy/arm_power_abs_mean
+- energy/total_power_abs_mean
+- energy/leg_power_squared_mean
+- energy/arm_power_squared_mean
+- energy/total_power_squared_mean
+- energy/leg_energy_sum
+- energy/arm_energy_sum
+- energy/total_energy_sum
+- energy/total_energy_per_step
+- energy/total_energy_per_episode
+
+Smoothness:
+- smoothness/leg_action_rate_mean
+- smoothness/arm_action_rate_mean
+- smoothness/total_action_rate_mean
+
+Coordination diagnostic:
+- coordination/corr_target_ee_x_base_pitch
+- coordination/corr_target_ee_z_base_pitch
+- coordination/corr_target_ee_y_base_roll
+- coordination/corr_ee_pos_err_base_ang_acc
+- coordination/corr_arm_action_norm_base_ang_acc
+- coordination/base_ang_acc_when_arm_large
+- coordination/base_lin_acc_when_arm_large
+- coordination/ee_pos_err_when_arm_large
+- coordination/vel_err_when_arm_large
+- coordination/survival_when_arm_large
+
+Workspace:
+- workspace/solvability_rate
+- workspace/success_points
+- workspace/hull_volume
+- workspace/hull_area_xy
+- workspace/hull_area_xz
+
+Warnings:
+- metrics/skipped
+- metrics/warnings
+
+============================================================
+七、保存和打印格式
+============================================================
+
+rollout 结束后打印：
+
+========== Coordination Evaluation ==========
+meta/num_envs: ...
+meta/eval_steps: ...
+vel/vx_mae: ...
+vel/yaw_mae: ...
+ee/pos_mean: ...
+ee/ori_geodesic_mean: ...
+ee/success_rate_step: ...
+stability/survival_rate_step: ...
+stability/base_ang_acc_rms: ...
+energy/total_power_abs_mean: ...
+smoothness/arm_action_rate_mean: ...
+coordination/base_ang_acc_when_arm_large: ...
+workspace/solvability_rate: ...
+workspace/hull_volume: ...
+warnings: ...
+=============================================
+
+同时保存：
+- coordination_eval_<timestamp>.json
+- coordination_eval_<timestamp>.csv
+
+csv 格式：
+key,value
+
+如果 --save_eval_traj 开启，则额外保存一个 npz：
+- coordination_eval_traj_<timestamp>.npz
+
+保存内容可包括：
+- ee_pos_err history
+- ee_ori_err history
+- base_height history
+- base_ang_acc history
+- vel_err history
+- success mask history
+
+注意：
+save_eval_traj 默认 False，避免文件太大。
+
+============================================================
+八、运行命令
+============================================================
+
+实现后请告诉我如何运行，例如：
+
+python low-level/legged_gym/scripts/play.py \
+  --task b1z1 \
+  --load_run <run_name> \
+  --checkpoint <checkpoint_id> \
+  --headless \
+  --eval_coordination \
+  --eval_steps 5000 \
+  --eval_warmup_steps 100
+
+如果当前 play.py 的参数名不是 --load_run / --checkpoint，请按仓库实际参数给出正确命令。
+
+============================================================
+九、鲁棒性要求
+============================================================
+
+1. 不允许因为缺少某个 metric 的变量而崩溃。
+2. 缺少变量时：
+   - 跳过该指标
+   - summary["metrics/skipped"] 中记录原因
+   - 终端打印一次 warning
+3. 兼容 num_envs > 1。
+4. 兼容 headless。
+5. 兼容 GPU tensor。
+6. 不要每 step CPU 同步。
+7. 不要每 step print。
+8. 不要引入必须安装的新依赖。
+9. scipy 只能作为 optional。
+10. 不要改 reward。
+11. 不要改 policy。
+12. 不要改 reset 逻辑。
+13. 不要影响普通 play 模式。
+
+============================================================
+十、优先级
+============================================================
+
+请分优先级实现。
+
+第一优先级，必须完成：
+1. velocity tracking error
+2. EE position error
+3. EE orientation error
+4. success rate
+5. survival rate
+6. base acceleration
+7. total energy
+8. action smoothness
+9. json/csv 保存
+10. play.py CLI 集成
+
+第二优先级，尽量完成：
+1. leg/arm energy split
+2. leg/arm action smoothness split
+3. stability under large arm motion
+4. base posture response correlation
+
+第三优先级，可选：
+1. workspace convex hull
+2. solvability by target segment
+3. perturbation survival eval
+
+============================================================
+十一、最后请输出
+============================================================
+
+完成后请给我：
+
+1. 修改文件列表。
+2. 每个文件的核心修改说明。
+3. 如何运行 evaluation。
+4. 输出文件保存在哪里。
+5. py_compile 或基本静态检查结果。
+6. 如果 Isaac Gym 环境无法在当前机器运行，请说明无法运行原因，但仍然完成代码实现。
+
+
+备注：
+运行命令：
+conda activate b1z1
+cd legged_gym/scripts
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+python play.py --exptid MARL_b1_z1_5D_base_command --task b1z1 --proj_name b1z1-low --checkpoint 45000   --sim_device cuda:1 \
+  --rl_device cuda:1 \
+  --observe_gait_commands 
+
+

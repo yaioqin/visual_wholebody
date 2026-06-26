@@ -28,7 +28,7 @@ python train.py  \
 
 
 
-python play.py --exptid MARL_b1_z1_5D_base_command --task b1z1 --proj_name b1z1-low --checkpoint 45000 --sim_device cpu --rl_device cpu --observe_gait_commands --record_video
+python play.py --exptid MARL_b1_z1_5D_base_command --task b1z1 --proj_name b1z1-low --checkpoint 45000 --sim_device cpu --rl_device cpu --observe_gait_commands 
 
 
 python train.py  \
