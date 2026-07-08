@@ -458,8 +458,11 @@ class CoordinationMetrics:
         self.current_episode_steps = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
 
         self.prev_actions: Optional[torch.Tensor] = None
+        self.prev_arm_motion_signal: Optional[torch.Tensor] = None
         self.prev_base_ang_vel: Optional[torch.Tensor] = None
         self.prev_base_lin_vel: Optional[torch.Tensor] = None
+        self.arm_motion_source = "unavailable"
+        self.arm_energy_source = "unavailable"
 
         self.history: Dict[str, List[torch.Tensor]] = {}
         self.traj: Dict[str, List[torch.Tensor]] = {}
@@ -480,9 +483,10 @@ class CoordinationMetrics:
         actions = self._batch_tensor(actions, "actions")
         base_lin_vel = self._get_base_lin_vel(env)
         base_ang_vel = self._get_base_ang_vel(env)
+        arm_motion_signal, _ = self._get_arm_motion_signal(env, actions)
 
         if self.rollout_steps <= self.warmup_steps:
-            self._cache_previous(actions, base_lin_vel, base_ang_vel)
+            self._cache_previous(actions, base_lin_vel, base_ang_vel, arm_motion_signal)
             return
 
         self.eval_steps += 1
@@ -567,15 +571,19 @@ class CoordinationMetrics:
                 leg_delta = delta.index_select(1, self._valid_indices(self.leg_action_indices, delta.shape[1]))
                 leg_action_rate = torch.linalg.norm(leg_delta, dim=-1) / max(self.dt, 1.0e-9)
                 self.acc.add("leg_action_rate", leg_action_rate)
-            if self.arm_action_indices.numel() > 0:
-                valid_arm = self._valid_indices(self.arm_action_indices, delta.shape[1])
-                arm_delta = delta.index_select(1, valid_arm)
-                arm_action_rate = torch.linalg.norm(arm_delta, dim=-1) / max(self.dt, 1.0e-9)
-                arm_action_delta = torch.linalg.norm(arm_delta, dim=-1)
-                arm_action_norm = torch.linalg.norm(actions.index_select(1, valid_arm), dim=-1)
-                self.acc.add("arm_action_rate", arm_action_rate)
         elif actions is None:
             self._skip_once("smoothness/action_rate", "actions tensor unavailable")
+        if arm_motion_signal is not None and self.prev_arm_motion_signal is not None:
+            dim = min(arm_motion_signal.shape[-1], self.prev_arm_motion_signal.shape[-1])
+            if dim > 0:
+                arm_motion_delta = arm_motion_signal[:, :dim] - self.prev_arm_motion_signal[:, :dim]
+                arm_action_rate = torch.linalg.norm(arm_motion_delta, dim=-1) / max(self.dt, 1.0e-9)
+                arm_action_delta = torch.linalg.norm(arm_motion_delta, dim=-1)
+                arm_action_norm = torch.linalg.norm(arm_motion_signal[:, :dim], dim=-1)
+                self.acc.add("arm_action_rate", arm_action_rate)
+                self.acc.add("arm_motion_rate", arm_action_rate)
+        elif arm_motion_signal is None:
+            self._skip_once("smoothness/arm_motion_rate", "arm target/action signal unavailable")
 
         self._append_coordination_histories(
             target_ee_pos=target_ee_pos,
@@ -599,7 +607,7 @@ class CoordinationMetrics:
         if vel_l1 is not None:
             self._append_traj("vel_err", vel_l1)
 
-        self._cache_previous(actions, base_lin_vel, base_ang_vel)
+        self._cache_previous(actions, base_lin_vel, base_ang_vel, arm_motion_signal)
 
     def summarize(self) -> Dict[str, Any]:
         summary: Dict[str, Any] = {
@@ -608,6 +616,8 @@ class CoordinationMetrics:
             "meta/warmup_steps": self.warmup_steps,
             "meta/dt": self.dt,
             "meta/total_samples": self._scalar(self.total_samples),
+            "meta/arm_motion_source": self.arm_motion_source,
+            "meta/arm_energy_source": self.arm_energy_source,
         }
 
         summary.update(
@@ -697,6 +707,7 @@ class CoordinationMetrics:
             {
                 "smoothness/leg_action_rate_mean": self._scalar(self.acc.mean("leg_action_rate")),
                 "smoothness/arm_action_rate_mean": self._scalar(self.acc.mean("arm_action_rate")),
+                "smoothness/arm_motion_rate_mean": self._scalar(self.acc.mean("arm_motion_rate")),
                 "smoothness/total_action_rate_mean": self._scalar(self.acc.mean("total_action_rate")),
             }
         )
@@ -745,6 +756,45 @@ class CoordinationMetrics:
         if arm is None:
             arm = torch.arange(12, min(num_actions, 18), device=self.device, dtype=torch.long)
         return leg, arm, warnings_out
+
+    def _get_arm_motion_signal(
+        self,
+        env: Any,
+        actions: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], str]:
+        arm_targets = self._batch_tensor(safe_get_tensor(env, ["arm_pos_targets"]), "arm_pos_targets")
+        if arm_targets is not None:
+            signal = arm_targets.reshape(self.num_envs, -1)
+            self.arm_motion_source = "arm_pos_targets"
+            return signal, self.arm_motion_source
+
+        all_targets = self._batch_tensor(
+            safe_get_tensor(env, ["all_pos_targets", "dof_pos_targets", "dof_position_targets"]),
+            "dof_position_targets",
+        )
+        if all_targets is not None and all_targets.dim() >= 2:
+            target_indices = _to_index_tensor(safe_get_nested_attr(env, "arm_pos_target_indices"), self.device)
+            if target_indices is None:
+                target_indices = self.arm_dof_indices
+            valid = self._valid_indices(target_indices, all_targets.shape[1])
+            if valid.numel() > 0:
+                self.arm_motion_source = "all_pos_targets"
+                return all_targets.index_select(1, valid), self.arm_motion_source
+
+        dof_pos = self._batch_tensor(safe_get_tensor(env, ["dof_pos"]), "dof_pos")
+        if dof_pos is not None and dof_pos.dim() >= 2:
+            valid = self._valid_indices(self.arm_dof_indices, dof_pos.shape[1])
+            if valid.numel() > 0:
+                self.arm_motion_source = "arm_dof_pos"
+                return dof_pos.index_select(1, valid), self.arm_motion_source
+
+        if actions is not None and self.arm_action_indices.numel() > 0:
+            valid = self._valid_indices(self.arm_action_indices, actions.shape[1])
+            if valid.numel() > 0:
+                self.arm_motion_source = "policy_arm_action"
+                return actions.index_select(1, valid), self.arm_motion_source
+
+        return None, "unavailable"
 
     def _batch_tensor(self, value: Any, name: str = "tensor") -> Optional[torch.Tensor]:
         if value is None:
@@ -1088,31 +1138,119 @@ class CoordinationMetrics:
         dim = min(torques.shape[-1], dof_vel.shape[-1])
         torques = torques[:, :dim]
         dof_vel = dof_vel[:, :dim]
-        power_abs = torch.abs(torques * dof_vel)
-        total_power = power_abs.sum(dim=-1)
-        total_power_sq = torch.square(power_abs).sum(dim=-1)
-        self.acc.add("total_power_abs", total_power)
-        self.acc.add("total_power_squared", total_power_sq)
-        self.energy_sums["total"] += total_power.double().sum() * self.dt
-
+        explicit_power_abs = torch.abs(torques * dof_vel)
         leg_idx = self._valid_indices(self.leg_dof_indices, dim)
         arm_idx = self._valid_indices(self.arm_dof_indices, dim)
+
+        total_power_values = explicit_power_abs.clone()
         if leg_idx.numel() > 0:
-            leg_power_values = power_abs.index_select(1, leg_idx)
+            leg_power_values = explicit_power_abs.index_select(1, leg_idx)
             leg_power = leg_power_values.sum(dim=-1)
             self.acc.add("leg_power_abs", leg_power)
             self.acc.add("leg_power_squared", torch.square(leg_power_values).sum(dim=-1))
             self.energy_sums["leg"] += leg_power.double().sum() * self.dt
         else:
             self._skip_once("energy/leg", "leg DOF indices unavailable")
+
         if arm_idx.numel() > 0:
-            arm_power_values = power_abs.index_select(1, arm_idx)
+            arm_power_values, arm_source = self._position_drive_arm_power_values(env, dof_vel, arm_idx, dim)
+            if arm_power_values is not None:
+                total_power_values[:, arm_idx] = arm_power_values
+                self.arm_energy_source = arm_source
+                self._warn_once(
+                    "Arm energy uses a position-drive torque proxy from DOF targets; "
+                    "Isaac position-control effort is not available in env.torques."
+                )
+            else:
+                arm_power_values = explicit_power_abs.index_select(1, arm_idx)
+                self.arm_energy_source = "explicit_force_torque"
             arm_power = arm_power_values.sum(dim=-1)
             self.acc.add("arm_power_abs", arm_power)
             self.acc.add("arm_power_squared", torch.square(arm_power_values).sum(dim=-1))
             self.energy_sums["arm"] += arm_power.double().sum() * self.dt
         else:
             self._skip_once("energy/arm", "arm DOF indices unavailable")
+
+        total_power = total_power_values.sum(dim=-1)
+        total_power_sq = torch.square(total_power_values).sum(dim=-1)
+        self.acc.add("total_power_abs", total_power)
+        self.acc.add("total_power_squared", total_power_sq)
+        self.energy_sums["total"] += total_power.double().sum() * self.dt
+
+    def _position_drive_arm_power_values(
+        self,
+        env: Any,
+        dof_vel: torch.Tensor,
+        arm_idx: torch.Tensor,
+        dim: int,
+    ) -> Tuple[Optional[torch.Tensor], str]:
+        dof_pos = self._batch_tensor(safe_get_tensor(env, ["dof_pos"]), "dof_pos")
+        if dof_pos is None:
+            return None, "unavailable"
+        dof_pos = dof_pos[:, :dim]
+
+        target = self._batch_tensor(
+            safe_get_tensor(env, ["all_pos_targets", "dof_pos_targets", "dof_position_targets"]),
+            "dof_position_targets",
+        )
+        if target is not None and target.dim() >= 2:
+            target = target[:, :dim].index_select(1, arm_idx)
+        else:
+            target = self._batch_tensor(safe_get_tensor(env, ["arm_pos_targets"]), "arm_pos_targets")
+            target_indices = _to_index_tensor(safe_get_nested_attr(env, "arm_pos_target_indices"), self.device)
+            if target is None or target_indices is None:
+                return None, "unavailable"
+            target_indices = self._valid_indices(target_indices, dim)
+            if target_indices.numel() != arm_idx.numel():
+                return None, "unavailable"
+            target = target.reshape(self.num_envs, -1)
+
+        if target.shape[-1] != arm_idx.numel():
+            return None, "unavailable"
+
+        stiffness = self._dof_vector_values(env, ["dof_drive_stiffness", "drive_stiffness"], arm_idx, dim)
+        damping = self._dof_vector_values(env, ["dof_drive_damping", "drive_damping"], arm_idx, dim)
+        if stiffness is None or damping is None:
+            return None, "unavailable"
+
+        arm_pos = dof_pos.index_select(1, arm_idx)
+        arm_vel = dof_vel.index_select(1, arm_idx)
+        torque_proxy = stiffness * (target - arm_pos) - damping * arm_vel
+        torque_limits = self._dof_vector_values(env, ["torque_limits"], arm_idx, dim)
+        if torque_limits is not None:
+            torque_proxy = torch.max(torch.min(torque_proxy, torque_limits), -torque_limits)
+        return torch.abs(torque_proxy * arm_vel), "position_drive_proxy"
+
+    def _dof_vector_values(
+        self,
+        env: Any,
+        names: Iterable[str],
+        indices: torch.Tensor,
+        dim: int,
+    ) -> Optional[torch.Tensor]:
+        values = safe_get_tensor(env, names)
+        if values is None:
+            return None
+        if not isinstance(values, torch.Tensor):
+            try:
+                values = torch.as_tensor(values, device=self.device)
+            except (TypeError, ValueError):
+                self._skip_once("/".join(names), "not tensor-like")
+                return None
+        values = values.detach().to(self.device)
+        if values.dim() == 0:
+            self._skip_once("/".join(names), "scalar tensor is not a DOF vector")
+            return None
+        if values.dim() == 1:
+            valid = self._valid_indices(indices, min(dim, values.shape[0]))
+            if valid.numel() != indices.numel():
+                return None
+            return values.index_select(0, valid).unsqueeze(0).expand(self.num_envs, -1)
+        values = values[:, :dim]
+        valid = self._valid_indices(indices, values.shape[1])
+        if valid.numel() != indices.numel():
+            return None
+        return values.index_select(1, valid)
 
     def _append_coordination_histories(
         self,
@@ -1143,19 +1281,25 @@ class CoordinationMetrics:
             self._append_history("coord_base_lin_acc", base_lin_acc_norm)
         if arm_action_delta is not None:
             self._append_history("arm_action_delta", arm_action_delta)
+            self._append_history("arm_motion_delta", arm_action_delta)
         if arm_action_norm is not None:
             self._append_history("arm_action_norm", arm_action_norm)
+            self._append_history("arm_motion_norm", arm_action_norm)
         if vel_l1 is not None:
             self._append_history("coord_vel_l1", vel_l1)
         self._append_history("coord_survival", survival)
 
     def _coordination_summary(self) -> Dict[str, float]:
+        arm_norm_key = "arm_motion_norm" if self._history_tensor("arm_motion_norm").numel() > 0 else "arm_action_norm"
+        arm_delta_key = "arm_motion_delta" if self._history_tensor("arm_motion_delta").numel() > 0 else "arm_action_delta"
+        corr_arm_motion = self._corr(arm_norm_key, "coord_base_ang_acc")
         out = {
             "coordination/corr_target_ee_x_base_pitch": self._corr("target_ee_x", "base_pitch"),
             "coordination/corr_target_ee_z_base_pitch": self._corr("target_ee_z", "base_pitch"),
             "coordination/corr_target_ee_y_base_roll": self._corr("target_ee_y", "base_roll"),
             "coordination/corr_ee_pos_err_base_ang_acc": self._corr("coord_ee_pos_err", "coord_base_ang_acc"),
-            "coordination/corr_arm_action_norm_base_ang_acc": self._corr("arm_action_norm", "coord_base_ang_acc"),
+            "coordination/corr_arm_action_norm_base_ang_acc": corr_arm_motion,
+            "coordination/corr_arm_motion_norm_base_ang_acc": corr_arm_motion,
             "coordination/base_ang_acc_when_arm_large": float("nan"),
             "coordination/base_lin_acc_when_arm_large": float("nan"),
             "coordination/ee_pos_err_when_arm_large": float("nan"),
@@ -1163,9 +1307,9 @@ class CoordinationMetrics:
             "coordination/survival_when_arm_large": float("nan"),
         }
 
-        arm_delta = self._history_tensor("arm_action_delta")
+        arm_delta = self._history_tensor(arm_delta_key)
         if arm_delta.numel() == 0:
-            self._skip_once("coordination/large_arm_motion", "arm action delta unavailable")
+            self._skip_once("coordination/large_arm_motion", "arm motion delta unavailable")
             return out
         finite = torch.isfinite(arm_delta)
         if finite.sum().item() == 0:
@@ -1289,9 +1433,12 @@ class CoordinationMetrics:
         actions: Optional[torch.Tensor],
         base_lin_vel: Optional[torch.Tensor],
         base_ang_vel: Optional[torch.Tensor],
+        arm_motion_signal: Optional[torch.Tensor],
     ) -> None:
         if actions is not None:
             self.prev_actions = actions.detach().clone()
+        if arm_motion_signal is not None:
+            self.prev_arm_motion_signal = arm_motion_signal.detach().clone()
         if base_lin_vel is not None:
             self.prev_base_lin_vel = base_lin_vel.detach().clone()
         if base_ang_vel is not None:

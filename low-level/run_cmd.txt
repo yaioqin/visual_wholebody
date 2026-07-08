@@ -27,8 +27,16 @@ python train.py  \
   --max_iterations 200
 
 
+python train.py  \
+  --exptid MARL_b1_z1_5D_base_command_wo_m_a2b --proj_name b1z1-low --task b1z1 \
+  --sim_device cuda:1 \
+  --rl_device cuda:1 \
+  --observe_gait_commands \
+  --headless
 
-python play.py --exptid MARL_b1_z1_5D_base_command --task b1z1 --proj_name b1z1-low --checkpoint 45000 --sim_device cpu --rl_device cpu --observe_gait_commands 
+python play.py --exptid MARL_b1_z1_5D_base_command_w_m_a2b \
+ --task b1z1 --proj_name b1z1-low --checkpoint 45000 --sim_device cpu --rl_device cpu --observe_gait_commands \
+ --eval_coordination
 
 
 python train.py  \
@@ -38,4 +46,58 @@ python train.py  \
   --observe_gait_commands \
   --headless
 
+
+python train.py  \
+  --exptid 2D_ --proj_name b1z1-low --task b1z1 \
+  --sim_device cuda:1 \
+  --rl_device cuda:1 \
+  --observe_gait_commands \
+  --headless
+
 python play.py --exptid MARL_b1_z1_5D_base_command --task b1z1 --proj_name b1z1-low --checkpoint 45000  --observe_gait_commands 
+
+
+python play.py --exptid MARL_b1_z1_5D_base_command_2 \
+ --headless \
+ --task b1z1 --proj_name b1z1-low --checkpoint 45000 --sim_device cuda:0 --rl_device cuda:0 \
+ --observe_gait_commands \
+ --eval_coordination \
+ --eval_steps 2000 \
+ --eval_warmup_steps 100 \
+ --eval_out_dir low-level/logs/b1z1-low/MARL_b1_z1_5D_base_command_2/eval_ckpt45000
+
+
+python play.py --exptid MARL_b1_z1_5D_base_command_wo_m_a2b \
+ --headless \
+ --task b1z1 --proj_name b1z1-low --checkpoint 45000 --sim_device cuda:0 --rl_device cuda:0 \
+ --observe_gait_commands \
+ --eval_coordination \
+ --eval_steps 2000 \
+ --eval_warmup_steps 100 \
+ --eval_out_dir low-level/logs/b1z1-low/MARL_b1_z1_5D_base_command_wo_m_a2b/eval_ckpt45000
+
+
+python play.py --exptid b1_z1_source \
+ --headless \
+ --task b1z1 --proj_name b1z1-low --checkpoint 45000 --sim_device cuda:0 --rl_device cuda:0 \
+ --observe_gait_commands \
+ --eval_coordination \
+ --eval_steps 2000 \
+ --eval_warmup_steps 100 \
+ --eval_out_dir low-level/logs/b1z1-low/b1_z1_source/eval_ckpt45000
+
+
+python play.py --exptid 3D_m_a2b \
+ --headless \
+ --task b1z1 --proj_name b1z1-low --checkpoint 45000 --sim_device cuda:0 --rl_device cuda:0 \
+ --observe_gait_commands \
+ --eval_coordination \
+ --eval_steps 2000 \
+ --eval_warmup_steps 100 \
+ --eval_out_dir low-level/logs/b1z1-low/3D_m_a2b/eval_ckpt45000
+
+
+python train.py    --exptid MARL_b1_z1_5D_base_command_wo_m_a2b --proj_name b1z1-low --task b1z1   --sim_device cuda:1   --rl_device cuda:1   --observe_gait_commands   --headless
+
+MARL_b1_z1_5D_base_command_wo_m_a2b
+wandb: Run data is saved locally in /home/xqq/visual_wholebody/low-level/legged_gym/envs/logs/wandb/offline-run-20260702_135353-wgiji6u2

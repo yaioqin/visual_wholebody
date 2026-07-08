@@ -124,6 +124,7 @@ class ManipLoco(LeggedRobot):
                 arm_delta_action=arm_delta_action,
                 jacobian=self.get_arm_jacobian(),
             )
+            arm_target_indices = self.arm_dof_indices_tensor
             # self.last_arm_delta_action[:] = arm_delta_action.detach()
         else:
             dpos = self.curr_ee_goal_cart_world - self.ee_pos
@@ -132,12 +133,13 @@ class ManipLoco(LeggedRobot):
             arm_dof_slice = self._scripted_arm_dof_slice()
             arm_jacobian = self.jacobian_whole[:, self.gripper_idx, :6, arm_dof_slice]
             arm_pos_targets = self._control_ik(dpose, arm_jacobian=arm_jacobian) + self.dof_pos[:, arm_dof_slice]
+            arm_target_indices = torch.arange(self.num_dofs, device=self.device, dtype=torch.long)[arm_dof_slice]
             # self.last_arm_delta_action[:] = 0.
         all_pos_targets = torch.zeros_like(self.dof_pos)
-        if self.use_policy_arm_delta_action:
-            all_pos_targets[:, self.arm_dof_indices_tensor] = arm_pos_targets
-        else:
-            all_pos_targets[:, self._scripted_arm_dof_slice()] = arm_pos_targets
+        all_pos_targets[:, arm_target_indices] = arm_pos_targets
+        self.arm_pos_targets = arm_pos_targets.clone()
+        self.arm_pos_target_indices = arm_target_indices.clone()
+        self.all_pos_targets = all_pos_targets.clone()
 
         for t in range(self.cfg.control.decimation):
             self.torques = self._compute_torques(self.actions)
@@ -575,6 +577,9 @@ class ManipLoco(LeggedRobot):
         dof_props_asset['driveMode'][12:].fill(gymapi.DOF_MODE_POS)  # set arm to pos control
         dof_props_asset['stiffness'][12:].fill(400.0)
         dof_props_asset['damping'][12:].fill(40.0)
+        self.dof_drive_mode = torch.as_tensor(dof_props_asset['driveMode'].copy(), device=self.device, dtype=torch.long)
+        self.dof_drive_stiffness = torch.as_tensor(dof_props_asset['stiffness'].copy(), device=self.device, dtype=torch.float)
+        self.dof_drive_damping = torch.as_tensor(dof_props_asset['damping'].copy(), device=self.device, dtype=torch.float)
         rigid_shape_props_asset = self.gym.get_asset_rigid_shape_properties(robot_asset)
         self.body_names = self.gym.get_asset_rigid_body_names(robot_asset)
         self.body_names_to_idx = self.gym.get_asset_rigid_body_dict(robot_asset)
@@ -951,6 +956,17 @@ class ManipLoco(LeggedRobot):
         self.d_gains = torch.zeros(self.num_torques, dtype=torch.float, device=self.device, requires_grad=False)
         self.actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
         self.last_actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
+        self.leg_action_indices = torch.arange(0, min(12, self.num_actions), dtype=torch.long, device=self.device)
+        self.arm_action_indices = torch.arange(12, min(18, self.num_actions), dtype=torch.long, device=self.device)
+        self.all_pos_targets = torch.zeros_like(self.dof_pos)
+        self.arm_pos_target_indices = self.arm_dof_indices_tensor.clone()
+        self.arm_pos_targets = torch.zeros(
+            self.num_envs,
+            self.arm_pos_target_indices.numel(),
+            dtype=torch.float,
+            device=self.device,
+            requires_grad=False,
+        )
         self.last_dof_vel = torch.zeros_like(self.dof_vel)
         self.last_root_vel = torch.zeros_like(self.root_states[:, 7:13])
         self.last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
