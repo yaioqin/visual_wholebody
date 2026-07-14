@@ -62,6 +62,7 @@ def train(args):
         wandb_kwargs["mode"] = mode
     wandb.init(**wandb_kwargs)
     wandb.save(LEGGED_GYM_ENVS_DIR + "/manip_loco/b1z1_config.py", policy="now")
+    wandb.save(LEGGED_GYM_ENVS_DIR + "/manip_loco/b1z1_config_3D.py", policy="now")
     wandb.save(LEGGED_GYM_ENVS_DIR + "/manip_loco/manip_loco.py", policy="now")
 
     env, env_cfg = task_registry.make_env(name=args.task, args=args)
