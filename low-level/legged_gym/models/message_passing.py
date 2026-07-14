@@ -58,33 +58,41 @@ class MultiAgentMessageBuilder:
         return torch.cat([rho_align, terminal_ee_motion], dim=-1)
 
     @staticmethod
-    def compute_manipulability(arm_jacobian, eps=1.0e-6, use_svd_fallback=True):
-        """Compute a batch-safe manipulability score from a Jacobian.
+    def compute_manipulability(
+        arm_jacobian,
+        eps=1.0e-6,
+        use_svd_fallback=True,
+    ):
+        """Compute Yoshikawa manipulability using singular values.
 
-        The primary path is sqrt(clamp(det(J J^T + eps I), min=0)).
-        If this determinant is non-finite or negative, the optional fallback uses
-        sqrt(prod(clamp(singular_values(J), min=eps))) as requested for rank
-        deficient or numerically unstable Jacobians.
+        For J in R^(m x n):
+            sqrt(det(J J^T)) = product(singular_values(J))
         """
+
         if arm_jacobian.dim() != 3:
-            raise ValueError("arm_jacobian must have shape [B, M, N]")
+            raise ValueError(
+                "arm_jacobian must have shape [B, M, N]"
+            )
 
-        batch, rows, _ = arm_jacobian.shape
-        jjt = arm_jacobian @ arm_jacobian.transpose(-1, -2)
-        eye = torch.eye(rows, device=arm_jacobian.device, dtype=arm_jacobian.dtype).expand(batch, rows, rows)
-        det_arg = jjt + eps * eye
-        det = torch.linalg.det(det_arg)
-        det_is_valid = torch.isfinite(det) & (det >= 0)
-        eta_det = torch.sqrt(torch.clamp(det, min=0.0)).unsqueeze(-1)
+        singular_values = torch.linalg.svdvals(
+            arm_jacobian
+        )
 
-        if not use_svd_fallback:
-            return torch.nan_to_num(eta_det, nan=0.0, posinf=0.0, neginf=0.0)
+        eta = torch.prod(
+            torch.clamp(
+                singular_values,
+                min=eps,
+            ),
+            dim=-1,
+            keepdim=True,
+        )
 
-        singular_values = torch.linalg.svdvals(arm_jacobian)
-        sv_product = torch.prod(torch.clamp(singular_values, min=eps), dim=-1)
-        eta_svd = torch.sqrt(torch.clamp(sv_product, min=eps)).unsqueeze(-1)
-        eta = torch.where(det_is_valid.unsqueeze(-1), eta_det, eta_svd)
-        return torch.nan_to_num(eta, nan=0.0, posinf=0.0, neginf=0.0)
+        return torch.nan_to_num(
+            eta,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
 
     @staticmethod
     def build(arm_action_chunk, arm_jacobian, object_pos_wrist, eps=1.0e-6, sigma_p=0.25):

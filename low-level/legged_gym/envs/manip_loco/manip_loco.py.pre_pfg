@@ -45,7 +45,6 @@ from legged_gym.utils.helpers import class_to_dict
 from legged_gym.utils.terrain import Terrain, Terrain_Perlin
 from legged_gym.models.message_passing import MultiAgentMessageBuilder
 from legged_gym.controllers.arm_ik_controller import ArmIKController, ArmIKControllerConfig
-from legged_gym.controllers.pfg_kinematics import PFGKinematics, PFGKinematicsConfig
 from .b1z1_config import B1Z1RoughCfg
 
 import sys
@@ -57,8 +56,6 @@ class ManipLoco(LeggedRobot):
     def __init__(self, cfg, *args, **kwargs):
         multi_agent_cfg = getattr(cfg, "multi_agent", None)
         command_cfg = getattr(cfg, "commands", None)
-        pfg_cfg = getattr(getattr(cfg, "rewards", None), "pfg", None)
-        self.use_pfg_reward = bool(getattr(pfg_cfg, "enabled", False))
         self.use_arm_delta_action = bool(getattr(multi_agent_cfg, "use_arm_delta_action", False))
         self.allow_arm_policy_action = bool(getattr(multi_agent_cfg, "allow_arm_policy_action", False))
         self.use_policy_arm_delta_action = self.use_arm_delta_action and self.allow_arm_policy_action
@@ -198,11 +195,6 @@ class ManipLoco(LeggedRobot):
         # update ee goal
         self._update_curr_ee_goal()
 
-        # PFG evaluates the current torso pose against the current EE
-        # reference, so it must run after goal interpolation and before
-        # compute_reward().
-        self._update_pfg_kinematics()
-
         # compute observations, rewards, resets, ...
         self.check_termination()
         self.compute_reward()
@@ -221,136 +213,6 @@ class ManipLoco(LeggedRobot):
             self._draw_ee_goal_curr()
             self._draw_ee_goal_traj()
             self._draw_collision_bbox()
-
-
-    # >>> PFG REWARD PATCH (3d_m_a2b) >>>
-    def _init_pfg_kinematics(self):
-        """Build a separate URDF FK/Jacobian model for virtual PFG IK."""
-        self.pfg_kinematics = None
-        self.pfg_q_ideal = None
-        self.pfg_ik_success = None
-        self.pfg_ik_energy = None
-        self.pfg_position_error = None
-        self.pfg_rotation_error = None
-
-        if not self.use_pfg_reward:
-            return
-
-        pfg_cfg = self.cfg.rewards.pfg
-        urdf_path = self.cfg.asset.file.format(
-            LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR
-        )
-        arm_limits = self.dof_pos_limits[self.arm_dof_indices_tensor]
-        solver_cfg = PFGKinematicsConfig(
-            max_iterations=int(pfg_cfg.max_iterations),
-            error_tolerance=float(pfg_cfg.error_tolerance),
-            damping_delta=float(pfg_cfg.damping_delta),
-            joint_limit_margin=float(pfg_cfg.joint_limit_margin),
-            max_joint_step=float(pfg_cfg.max_joint_step),
-            pose_error_weights=tuple(float(x) for x in pfg_cfg.pose_error_weights),
-        )
-        self.pfg_kinematics = PFGKinematics(
-            urdf_path=urdf_path,
-            end_link_name=self.cfg.multi_agent.ee_body_name,
-            arm_joint_names=self.cfg.multi_agent.arm_dof_names,
-            joint_lower_limits=arm_limits[:, 0],
-            joint_upper_limits=arm_limits[:, 1],
-            device=self.device,
-            dtype=torch.float32,
-            config=solver_cfg,
-        )
-
-        current_arm_q = self.dof_pos[:, self.arm_dof_indices_tensor].clone()
-        self.pfg_q_ideal = current_arm_q
-        self.pfg_ik_success = torch.zeros(
-            self.num_envs,
-            dtype=torch.bool,
-            device=self.device,
-        )
-        self.pfg_ik_energy = torch.full(
-            (self.num_envs,),
-            float("inf"),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self.pfg_position_error = torch.full_like(
-            self.pfg_ik_energy,
-            float("inf"),
-        )
-        self.pfg_rotation_error = torch.full_like(
-            self.pfg_ik_energy,
-            float("inf"),
-        )
-        print(
-            "||||||||||PFG enabled: batched URDF IK, "
-            f"root={self.pfg_kinematics.root_link_name}, "
-            f"joints={self.pfg_kinematics.chain_joint_names}"
-        )
-
-    def _reset_pfg_buffers(self, env_ids):
-        if (
-            not self.use_pfg_reward
-            or not hasattr(self, "pfg_q_ideal")
-            or self.pfg_q_ideal is None
-            or len(env_ids) == 0
-        ):
-            return
-        current_arm_q = self.dof_pos[env_ids][:, self.arm_dof_indices_tensor]
-        self.pfg_q_ideal[env_ids] = current_arm_q
-        self.pfg_ik_success[env_ids] = False
-        self.pfg_ik_energy[env_ids] = float("inf")
-        self.pfg_position_error[env_ids] = float("inf")
-        self.pfg_rotation_error[env_ids] = float("inf")
-
-    @torch.no_grad()
-    def _update_pfg_kinematics(self, force=False):
-        if not self.use_pfg_reward or self.pfg_kinematics is None:
-            return
-
-        interval = max(1, int(self.cfg.rewards.pfg.update_interval))
-        if not force and (self.common_step_counter % interval != 0):
-            return
-
-        # W T_target -> B T_target using the full current base orientation,
-        # not only base yaw. This is the paper's torso-dependent target pose.
-        target_position_body = quat_rotate_inverse(
-            self.base_quat,
-            self.curr_ee_goal_cart_world - self.base_pos,
-        )
-        target_quaternion_body = quat_mul(
-            quat_conjugate(self.base_quat),
-            self.ee_goal_orn_quat,
-        )
-        target_quaternion_body = target_quaternion_body / torch.clamp(
-            torch.norm(
-                target_quaternion_body,
-                p=2,
-                dim=-1,
-                keepdim=True,
-            ),
-            min=1.0e-8,
-        )
-
-        current_arm_q = self.dof_pos[:, self.arm_dof_indices_tensor]
-        (
-            q_ideal,
-            ik_success,
-            ik_energy,
-            position_error,
-            rotation_error,
-        ) = self.pfg_kinematics.solve(
-            target_position_body=target_position_body,
-            target_quaternion_body_xyzw=target_quaternion_body,
-            current_arm_q=current_arm_q,
-            previous_solution=self.pfg_q_ideal,
-        )
-
-        self.pfg_q_ideal[:] = q_ideal
-        self.pfg_ik_success[:] = ik_success
-        self.pfg_ik_energy[:] = ik_energy
-        self.pfg_position_error[:] = position_error
-        self.pfg_rotation_error[:] = rotation_error
-    # <<< PFG REWARD PATCH (3d_m_a2b) <<<
 
     def compute_reward(self):
         """ Compute rewards
@@ -548,7 +410,6 @@ class ManipLoco(LeggedRobot):
             command_env_ids = self.time_out_buf.nonzero(as_tuple=False).flatten()
         self._resample_commands(command_env_ids)
         self._resample_ee_goal(env_ids, is_init=True)
-        self._reset_pfg_buffers(env_ids)
 
         # reset buffers
         self.last_torques[env_ids] = 0.
@@ -1021,7 +882,6 @@ class ManipLoco(LeggedRobot):
         self.ee_orn = self.rigid_body_state[:, self.gripper_idx, 3:7]
         self.ee_vel = self.rigid_body_state[:, self.gripper_idx, 7:]
         self.ee_j_eef = self.get_arm_jacobian(refresh=False)
-        self._init_pfg_kinematics()
         chunk_horizon = getattr(getattr(self.cfg, "multi_agent", None), "arm_chunk_horizon", 1)
         assert chunk_horizon == 1, "Current low-level training expects arm_chunk_horizon == 1"
         self.prev_arm_action_chunk = torch.zeros(self.num_envs, chunk_horizon, 6, device=self.device)

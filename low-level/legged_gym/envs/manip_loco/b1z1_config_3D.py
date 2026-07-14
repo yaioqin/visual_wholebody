@@ -269,7 +269,7 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
             orientation = 0.0
             orientation_walking = 0.0
             orientation_standing = 0.0
-            base_height = -5.0
+            base_height = -4.0 ## 原：-5.0
             torques_walking = 0.0
             torques_standing = 0.0
             energy_square = 0.0
@@ -282,13 +282,13 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
         class arm_scales:
             arm_termination = None
             tracking_ee_sphere = 0.
-            tracking_ee_world = 0.8
+            tracking_ee_world = 1.5 ## 原：0.8
             tracking_ee_sphere_walking = 0.0
             tracking_ee_sphere_standing = 0.0
             tracking_ee_cart = None
             arm_orientation = None
             arm_energy_abs_sum = None
-            tracking_ee_orn = 0.
+            tracking_ee_orn = 0. ## 原：0.
             tracking_ee_orn_ry = None
         
     class viewer:
