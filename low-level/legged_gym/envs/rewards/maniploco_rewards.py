@@ -226,7 +226,10 @@ class ManipLoco_rewards:
     
     def _reward_base_height(self):
         # Penalize base height away from target
-        base_height = torch.mean(self.env.root_states[:, 2].unsqueeze(1), dim=1)
+        base_height = torch.mean(
+            self.env.root_states[:, 2].unsqueeze(1) - self.env.measured_heights,
+            dim=1,
+        )
         return torch.abs(base_height - self.env.cfg.rewards.base_height_target), base_height
     
     def _reward_orientation_walking(self):
@@ -317,7 +320,7 @@ class ManipLoco_rewards:
 
         reward = 0
         for i in range(4):
-            reward += - (1 - desired_contact[:, i]) * (
+            reward += (1 - desired_contact[:, i]) * (
                         1 - torch.exp(-1 * foot_forces[:, i] ** 2 / self.env.cfg.rewards.gait_force_sigma))
         
         # cmd_stop_flag = ~self.env._get_walking_cmd_mask()
@@ -331,8 +334,8 @@ class ManipLoco_rewards:
         desired_contact = self.env.desired_contact_states
         reward = 0
         for i in range(4):
-            reward += - (desired_contact[:, i] * (
-                        1 - torch.exp(-1 * foot_velocities[:, i] ** 2 / self.env.cfg.rewards.gait_vel_sigma)))
+            reward += desired_contact[:, i] * (
+                        1 - torch.exp(-1 * foot_velocities[:, i] ** 2 / self.env.cfg.rewards.gait_vel_sigma))
         # cmd_stop_flag = ~self.env._get_walking_cmd_mask()
         # reward[cmd_stop_flag] = 0
         

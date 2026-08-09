@@ -55,15 +55,26 @@ def play(args):
     # env_cfg.env.episode_length_s = 10000
     env_cfg.domain_rand.push_robots = False
     # env_cfg.domain_rand.push_interval_s = 2
-    env_cfg.domain_rand.randomize_base_mass = True #False
+    env_cfg.domain_rand.randomize_friction = False
+    env_cfg.domain_rand.randomize_base_mass = False
     env_cfg.domain_rand.randomize_base_com = False
+    env_cfg.domain_rand.randomize_motor = False
+    env_cfg.domain_rand.randomize_gripper_mass = False
+    env_cfg.init_state.rand_yaw_range = 0.0
+    env_cfg.init_state.origin_perturb_range = 0.0
+    env_cfg.init_state.init_vel_perturb_range = 0.0
+    if args.stand_by:
+        env_cfg.env.teleop_mode = True
+    if args.zero_commands:
+        env_cfg.env.force_zero_commands = True
     
     if args.flat_terrain:
         env_cfg.terrain.height = [0.0, 0.0]
+        env_cfg.terrain.num_rows = 2
+        env_cfg.terrain.num_cols = 1
 
     # prepare environment
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
-    obs = env.get_observations()
     # load policy
     train_cfg.runner.resume = True
     ppo_runner, train_cfg, checkpoint, log_pth = task_registry.make_alg_runner(log_root = log_pth, env=env, name=args.task, args=args, train_cfg=train_cfg, return_log_dir=True)
@@ -104,7 +115,8 @@ def play(args):
         import imageio
         env.enable_viewer_sync = False
         for i in range(env.num_envs):
-            video_name = args.exptid+ f'-{i}-' + str(checkpoint) +".mp4"
+            video_tag = f'-{args.video_tag}' if args.video_tag else ''
+            video_name = args.exptid + video_tag + f'-{i}-' + str(checkpoint) + ".mp4"
             run_name = log_pth.split("/")[-1]
             path = f"../../logs/videos/{run_name}"
             if not os.path.exists(path):
@@ -113,20 +125,39 @@ def play(args):
             mp4_writer = imageio.get_writer(video_name, fps=25)
             mp4_writers.append(mp4_writer)
 
-    if not args.record_video:
+    if args.play_seconds > 0:
+        traj_length = max(1, int(np.ceil(args.play_seconds / env.dt)))
+    elif not args.record_video:
         traj_length = 1000*int(env.max_episode_length)
     else:
         traj_length = int(env.max_episode_length)
 
     # env.update_command_curriculum()
-    env.reset()
+    env.global_steps = 10000 * 24
+    obs, _ = env.reset()
+    if args.stand_by:
+        env.commands[:] = 0.
+        env.goal_timer[:] = 0.
+        env._update_curr_ee_goal()
+        env.goal_timer[:] = 0.
+        env.compute_observations()
+        obs = env.get_observations()
+    elif args.zero_commands:
+        env.commands[:] = 0.
+        env.compute_observations()
+        obs = env.get_observations()
+
+    reset_count = 0
+    max_leg_action_abs = 0.
     for i in range(traj_length):
         start_time = time.time()
         if args.use_jit:
             actions = policy(torch.cat((obs[:, :env.cfg.env.num_proprio], obs[:, env.cfg.env.num_proprio+env.cfg.env.num_priv:]), dim=1))
         else:
             actions = policy(obs.detach(), hist_encoding=True)
+        max_leg_action_abs = max(max_leg_action_abs, actions[:, :12].abs().max().item())
         obs, _, rews, arm_rews, dones, infos = env.step(actions.detach())
+        reset_count += int(dones.sum().item())
         if args.record_video:
             imgs = env.render_record(mode='rgb_array')
             if imgs is not None:
@@ -141,6 +172,15 @@ def play(args):
     if args.record_video:
         for mp4_writer in mp4_writers:
             mp4_writer.close()
+
+    print(
+        "Play summary: steps={}, duration_s={:.2f}, resets={}, max_leg_action_abs={:.3f}".format(
+            traj_length,
+            traj_length * env.dt,
+            reset_count,
+            max_leg_action_abs,
+        )
+    )
 
 if __name__ == '__main__':
     EXPORT_POLICY = False

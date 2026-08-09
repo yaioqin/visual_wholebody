@@ -115,6 +115,7 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
         episode_length_s = 10 # episode length in seconds
         reorder_dofs = True
         teleop_mode = False # Overriden in teleop.py. When true, commands come from keyboard
+        force_zero_commands = False # Evaluation-only switch: retain autonomous arm goals while holding base commands at zero
         record_video = False
         stand_by = False
         observe_gait_commands = False
@@ -183,6 +184,7 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
     
     class arm:
         init_target_ee_base = [0.2, 0.0, 0.2]
+        arm_base_offset = [0.3, 0.0, 0.09]
         grasp_offset = 0.08
         osc_kp = np.array([100, 100, 100, 30, 30, 30])
         osc_kd = 2 * (osc_kp ** 0.5)
@@ -231,8 +233,8 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
         # To not compute and log a given metric, set the scale to None
         class scales:
             # -------Gait control rewards ---------
-            tracking_contacts_shaped_force = -2.0 # Only works when `observing_gait_commands` is true
-            tracking_contacts_shaped_vel = -2.0 # Only works when `observing_gait_commands` is true
+            tracking_contacts_shaped_force = -0.2 # Only works when `observing_gait_commands` is true
+            tracking_contacts_shaped_vel = -0.2 # Only works when `observing_gait_commands` is true
             feet_air_time = 2.0
             feet_height = 1.0
 
@@ -257,7 +259,7 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
             # common rewards
             ang_vel_xy = -0.2 
             dof_acc = -7.5e-7 
-            collision = -10.
+            collision = -0.001
             action_rate = -0.015
             dof_pos_limits = -10.0
             delta_torques = -1.0e-7
@@ -401,7 +403,7 @@ class B1Z1RoughCfgPPO(LeggedRobotCfgPPO):
         num_steps_per_env = 24
         max_iterations = 45000 # number of policy updates
         # logging
-        save_interval = 200 # check for potential saves every this many iterations
+        save_interval = 2000 # check for potential saves every this many iterations
         experiment_name = 'b1z1_v2'
         run_name = ''
         # load and resume
@@ -409,3 +411,60 @@ class B1Z1RoughCfgPPO(LeggedRobotCfgPPO):
         load_run = -1 # -1 = last run
         checkpoint = -1 # -1 = last saved model
         resume_path = None # updated from load_run and chkpt
+
+
+class AliengoZ1RoughCfg(B1Z1RoughCfg):
+    class goal_ee(B1Z1RoughCfg.goal_ee):
+        class sphere_center(B1Z1RoughCfg.goal_ee.sphere_center):
+            # Unitree aliengoZ1_description: trunk_length / 2 - 0.07.
+            x_offset = 0.2535
+
+    class init_state(B1Z1RoughCfg.init_state):
+        pos = [0.0, 0.0, 0.45] # x,y,z [m]
+
+    class asset(B1Z1RoughCfg.asset):
+        file = '{LEGGED_GYM_ROOT_DIR}/resources/robots/aliengo_z1/urdf/aliengo_z1.urdf'
+        flip_visual_attachments = True
+
+    class arm(B1Z1RoughCfg.arm):
+        # Unitree aliengoZ1_description uses
+        # [trunk_length / 2 - 0.07, 0, trunk_height / 2].
+        arm_base_offset = [0.2535, 0.0, 0.056]
+
+    class domain_rand(B1Z1RoughCfg.domain_rand):
+        added_mass_range = [0., 8.]
+        added_com_range_x = [-0.10, 0.10]
+        added_com_range_y = [-0.10, 0.10]
+        added_com_range_z = [-0.10, 0.10]
+
+    class rewards(B1Z1RoughCfg.rewards):
+        base_height_target = 0.42
+
+
+class AliengoZ1RoughCfgPPO(B1Z1RoughCfgPPO):
+    class policy(B1Z1RoughCfgPPO.policy):
+        adaptive_arm_gains = AliengoZ1RoughCfg.control.adaptive_arm_gains
+
+    class algorithm(B1Z1RoughCfgPPO.algorithm):
+        torque_supervision = AliengoZ1RoughCfg.control.torque_supervision
+        adaptive_arm_gains = AliengoZ1RoughCfg.control.adaptive_arm_gains
+
+    class runner(B1Z1RoughCfgPPO.runner):
+        experiment_name = 'aliengo_z1'
+
+
+class AliengoZ1BoundedActionsCfg(AliengoZ1RoughCfg):
+    """Aliengo-Z1 control experiment with gait observations fixed on."""
+
+    class env(AliengoZ1RoughCfg.env):
+        observe_gait_commands = True
+
+
+class AliengoZ1BoundedActionsCfgPPO(AliengoZ1RoughCfgPPO):
+    """Keep the baseline dynamics and training setup, but bound policy actions."""
+
+    class policy(AliengoZ1RoughCfgPPO.policy):
+        output_tanh = True
+
+    class runner(AliengoZ1RoughCfgPPO.runner):
+        experiment_name = 'aliengo_z1_bounded_actions'

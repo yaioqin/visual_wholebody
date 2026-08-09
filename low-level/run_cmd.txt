@@ -1,0 +1,73 @@
+# Run these commands from the repository root.
+
+conda activate b1z1
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+export TORCH_EXTENSIONS_DIR=/tmp/torch_extensions
+
+cd low-level/legged_gym/scripts
+
+# Visualize Aliengo + Z1 standby pose.
+python visualize_aliengo_z1_standby.py \
+  --sim_device cuda:0
+
+# Optional: inspect Z1 assembly in zero joint pose.
+python visualize_aliengo_z1_standby.py \
+  --sim_device cuda:0 \
+  --arm_zero
+
+# Train Aliengo + Z1.
+python train.py \
+  --exptid MARL_aliengo_z1 \
+  --proj_name aliengo-z1-low \
+  --task aliengo_z1 \
+  --sim_device cuda:0 \
+  --rl_device cuda:0 \
+  --observe_gait_commands
+
+  --headless \
+
+# Fast smoke test.
+python train.py \
+  --headless \
+  --debug \
+  --exptid aliengo_z1_debug \
+  --proj_name aliengo-z1-low \
+  --task aliengo_z1 \
+  --sim_device cuda:0 \
+  --rl_device cuda:0 \
+  --observe_gait_commands \
+  --num_envs 16 \
+  --max_iterations 1
+
+# Play a trained Aliengo + Z1 checkpoint.
+python play.py \
+  --exptid MARL_aliengo_z1 \
+  --task aliengo_z1 \
+  --proj_name aliengo-z1-low \
+  --checkpoint 44000 \
+  --sim_device cuda:0 \
+  --rl_device cuda:0 \
+  --observe_gait_commands \
+  --record_video
+
+# Reinstall local dependencies when the editable installs are stale.
+cd ../../..
+pip uninstall -y isaacgym
+pip uninstall -y legged-gym
+pip uninstall -y rsl-rl
+pip uninstall -y skrl
+cd third_party/isaacgym/python && pip install -e .
+cd ../../..
+cd rsl_rl && pip install -e .
+cd ..
+cd skrl && pip install -e .
+cd ..
+cd low-level && pip install -e .
+
+
+python visualize_aliengo_z1_standby.py \
+  --zero_action_pd \
+  --sim_device cuda:0 \
+  --pipeline gpu \
+  --zero_action_steps 500 \
+  --zero_action_log_interval 20

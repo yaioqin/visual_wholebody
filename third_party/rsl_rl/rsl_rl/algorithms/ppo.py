@@ -196,12 +196,14 @@ class PPO:
 
 
                 # Surrogate loss
-                only_train_leg = False
+                # The VBC low-level policy controls only the 12 leg joints. The
+                # six arm outputs are masked by the environment because the arm
+                # follows its end-effector target through IK.
+                only_train_leg = True
 
                 mixing_advantages_batch = torch.zeros_like(advantages_batch)
                 if only_train_leg == True:
-                    mixing_advantages_batch[..., 0] = advantages_batch[..., 0]
-                    mixing_advantages_batch[..., 1] = advantages_batch[..., 1]
+                    mixing_advantages_batch[..., 0] = advantages_batch[..., 0] + value_mixing_ratio * advantages_batch[..., 1]
                 else:
                     mixing_advantages_batch[..., 0] = advantages_batch[..., 0] + value_mixing_ratio * advantages_batch[..., 1]
                     mixing_advantages_batch[..., 1] = advantages_batch[..., 1] + value_mixing_ratio * advantages_batch[..., 0]
@@ -330,4 +332,3 @@ class PPO:
         arm_torques = fixed_arm_p_gains * (target_arm_dof_pos + self.default_arm_dof_pos - current_arm_dof_pos) \
             - fixed_arm_d_gains * current_arm_dof_vel
         return arm_torques
-

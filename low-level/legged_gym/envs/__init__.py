@@ -29,10 +29,24 @@
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
 from .manip_loco.manip_loco import ManipLoco
+from .manip_loco.aliengo_z1_config import (
+    AliengoZ1BoundedActionsCfg,
+    AliengoZ1BoundedActionsCfgPPO,
+    AliengoZ1RoughCfg,
+    AliengoZ1RoughCfgPPO,
+)
 from .manip_loco.b1z1_config import B1Z1RoughCfg, B1Z1RoughCfgPPO
 
 import os
 
 from legged_gym.utils.task_registry import task_registry
 
-task_registry.register( "b1z1", ManipLoco, B1Z1RoughCfg(), B1Z1RoughCfgPPO(), 'b1z1')
+task_registry.register( "b1z1", ManipLoco, B1Z1RoughCfg(), B1Z1RoughCfgPPO(), 'manip_loco')
+task_registry.register( "aliengo_z1", ManipLoco, AliengoZ1RoughCfg(), AliengoZ1RoughCfgPPO(), 'manip_loco')
+task_registry.register(
+    "aliengo_z1_bounded_actions",
+    ManipLoco,
+    AliengoZ1BoundedActionsCfg(),
+    AliengoZ1BoundedActionsCfgPPO(),
+    'manip_loco',
+)
