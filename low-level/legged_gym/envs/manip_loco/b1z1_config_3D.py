@@ -55,9 +55,12 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
             pos_p = [-1 * np.pi / 2.5, 1 * np.pi / 3]
             pos_y = [-1.2, 1.2]
             
-            delta_orn_r = [-0.5, 0.5]
-            delta_orn_p = [-0.5, 0.5]
-            delta_orn_y = [-0.5, 0.5]
+            # delta_orn_r = [-0.5, 0.5] # 原
+            # delta_orn_p = [-0.5, 0.5] # 原
+            # delta_orn_y = [-0.5, 0.5] # 原
+            delta_orn_r = [-1.5, 1.5] # dq_net
+            delta_orn_p = [-1.2, 1.6] # dq_net
+            delta_orn_y = [-0.8, 0.8] # dq_net
             final_tracking_ee_reward = 0.55
 
         sphere_error_scale = [1, 1, 1]#[1 / (ranges.final_pos_l[1] - ranges.final_pos_l[0]), 1 / (ranges.final_pos_p[1] - ranges.final_pos_p[0]), 1 / (ranges.final_pos_y[1] - ranges.final_pos_y[0])]
@@ -269,7 +272,7 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
             orientation = 0.0
             orientation_walking = 0.0
             orientation_standing = 0.0
-            base_height = -4.0 ## 原：-5.0
+            base_height = -4.0 ## 原：-5.0 ,dq_net:-4.0
             torques_walking = 0.0
             torques_standing = 0.0
             energy_square = 0.0
@@ -282,7 +285,7 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
         class arm_scales:
             arm_termination = None
             tracking_ee_sphere = 0.
-            tracking_ee_world = 1.5 ## 原：0.8
+            tracking_ee_world = 1.5 ## 原：0.8 ,dq_net:1.5
             tracking_ee_sphere_walking = 0.0
             tracking_ee_sphere_standing = 0.0
             tracking_ee_cart = None

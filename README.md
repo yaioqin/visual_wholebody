@@ -84,3 +84,15 @@ If you find the code base helpful, consider to cite
     year={2024}
 }
 ```
+
+$$p_{soft}=0.20,p_{critical}=0.10$$
+$$
+C_{\mathrm{mani}}(\rho_t)=
+\begin{cases}
+0, & \rho_t \geq 0.20,\\
+0.3\left(\dfrac{0.20-\rho_t}{0.10}\right)^2, & 0.10 \leq \rho_t < 0.20,\\
+0.3+0.7\left(\dfrac{0.10-\rho_t}{0.10}\right)^2, & 0 \leq \rho_t < 0.10.
+\end{cases}
+$$
+$$[p_{critical},p_{soft})$$
+$$[0,p_{soft})$$

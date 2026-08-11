@@ -21,7 +21,7 @@ class B1Z1RoughCfg(B1Z1RoughCfg3D):
         )
 
     class multi_agent:
-        use_arm_base_message = True
+        use_arm_base_message = False # False/True
 
         use_arm_delta_action = False
         allow_arm_policy_action = False
@@ -84,7 +84,7 @@ class B1Z1RoughCfg(B1Z1RoughCfg3D):
         class scales(B1Z1RoughCfg3D.rewards.scales):
             # PFG is a torso/base feasibility reward. Keep it in base scales,
             # especially while allow_arm_policy_action=False.
-            pfg_feasible = 0.16  # 总奖励中pfg奖励函数的权值
+            pfg_feasible = 0.16  # 总奖励中pfg奖励函数的权值 0.16/0.0
             low_manipulability = -0.15
     # <<< PFG REWARD PATCH (3d_m_a2b) <<<
 

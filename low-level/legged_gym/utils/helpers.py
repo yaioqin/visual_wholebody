@@ -148,6 +148,15 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
         if args.allow_arm_policy_action and hasattr(env_cfg, "multi_agent"):
             env_cfg.multi_agent.use_arm_delta_action = True
             env_cfg.multi_agent.allow_arm_policy_action = True
+        if hasattr(env_cfg, "rewards"):
+            if hasattr(env_cfg.rewards, "pfg"):
+                env_cfg.rewards.pfg.enabled = args.pfg_enabled
+                if not args.pfg_enabled and hasattr(env_cfg.rewards, "scales"):
+                    env_cfg.rewards.scales.pfg_feasible = 0.0
+            if hasattr(env_cfg.rewards, "manipulability"):
+                env_cfg.rewards.manipulability.enabled = args.manipulability_enabled
+                if not args.manipulability_enabled and hasattr(env_cfg.rewards, "scales"):
+                    env_cfg.rewards.scales.low_manipulability = 0.0
         if args.record_video:
             env_cfg.env.record_video = args.record_video
         if args.stand_by:
@@ -187,6 +196,8 @@ def get_args(test=False):
         {"name": "--disable_5d_base_command", "action": "store_true", "default": False, "help": "Disable 5D base command observation for old checkpoints"},
         {"name": "--disable_arm_base_message", "action": "store_true", "default": False, "help": "Disable arm-to-base message observation for old checkpoints"},
         {"name": "--allow_arm_policy_action", "action": "store_true", "default": False, "help": "Allow the policy's last 6 actions to drive the arm delta IK controller"},
+        {"name": "--pfg_enabled", "action": "store_true", "default": False, "help": "Enable the PFG feasibility reward"},
+        {"name": "--manipulability_enabled", "action": "store_true", "default": False, "help": "Enable the low-manipulability reward"},
         
         {"name": "--exptid", "type": str,  "required": True if not test else False,  "help": "Experiment ID"},
         {"name": "--debug", "action": "store_true", "default": False, "help": "Disable wandb logging"},
