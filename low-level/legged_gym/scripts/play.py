@@ -80,6 +80,20 @@ def _print_coordination_summary(summary):
 
 def play(args):
     log_pth = LEGGED_GYM_ROOT_DIR + "/logs/{}/".format(args.proj_name) + args.exptid
+    if not os.path.isdir(log_pth):
+        project_log_dir = os.path.dirname(log_pth)
+        available_runs = []
+        if os.path.isdir(project_log_dir):
+            available_runs = sorted(
+                name
+                for name in os.listdir(project_log_dir)
+                if os.path.isdir(os.path.join(project_log_dir, name))
+            )
+        raise FileNotFoundError(
+            f"Experiment directory does not exist: {log_pth}. "
+            f"Available runs under {project_log_dir}: {available_runs}"
+        )
+
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
     # override some parameters for testing
     env_cfg.env.num_envs = 1
@@ -92,6 +106,26 @@ def play(args):
     # env_cfg.domain_rand.push_interval_s = 2
     env_cfg.domain_rand.randomize_base_mass = True #False
     env_cfg.domain_rand.randomize_base_com = False
+
+    if getattr(env_cfg.terrain, "dwbc_perlin", False):
+        # The training map is 600 x 10000 samples (roughly 12 million
+        # triangles). GPU PhysX can segfault while cooking a mesh that large
+        # during single-environment evaluation. Halving the sampling density
+        # preserves the 15 m x 250 m footprint, Perlin physical frequency and
+        # height distribution while reducing the mesh to roughly one quarter
+        # of the triangles. Training continues to use the reference grid.
+        terrain_width_m = env_cfg.terrain.tot_cols * env_cfg.terrain.horizontal_scale
+        terrain_length_m = env_cfg.terrain.tot_rows * env_cfg.terrain.horizontal_scale
+        env_cfg.terrain.horizontal_scale *= 2.0
+        env_cfg.terrain.tot_cols = int(round(terrain_width_m / env_cfg.terrain.horizontal_scale))
+        env_cfg.terrain.tot_rows = int(round(terrain_length_m / env_cfg.terrain.horizontal_scale))
+        env_cfg.terrain.transform_x = -terrain_width_m / 2.0
+        env_cfg.terrain.transform_y = -terrain_length_m / 2.0
+        print(
+            "DWBC evaluation terrain: "
+            f"{env_cfg.terrain.tot_cols} x {env_cfg.terrain.tot_rows} samples, "
+            f"{terrain_width_m:g} m x {terrain_length_m:g} m footprint"
+        )
     
     if args.flat_terrain:
         env_cfg.terrain.height = [0.0, 0.0]
