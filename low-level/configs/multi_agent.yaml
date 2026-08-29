@@ -3,15 +3,15 @@ multi_agent:
   train_stage: base
 
   # Current supported path: 18D low-level PPO only.
-  use_arm_delta_action: true
-  allow_arm_policy_action: false
+  use_arm_delta_action: false
+  allow_arm_policy_action: true
   arm_chunk_horizon: 1
   fixed_h: 1
   disable_gripper: true
   use_high_level_policy: false
 
   # Observation/reward switches for the existing low-level environment.
-  use_arm_base_message: true
+  use_arm_base_message: false
   use_assist_reward: false
 
   # Gripper defaults.
@@ -50,7 +50,7 @@ multi_agent:
   assist_reward_scale: 0.05
 
 commands:
-  use_5d_base_command: true
+  use_5d_base_command: false
   ranges:
     base_pitch: [-0.3, 0.3]
     base_height: [0.32, 0.45]

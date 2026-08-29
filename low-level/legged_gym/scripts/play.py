@@ -95,6 +95,8 @@ def play(args):
     
     if args.flat_terrain:
         env_cfg.terrain.height = [0.0, 0.0]
+        if hasattr(env_cfg.terrain, "zScale"):
+            env_cfg.terrain.zScale = 0.0
 
     # prepare environment
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)

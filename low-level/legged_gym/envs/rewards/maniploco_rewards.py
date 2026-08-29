@@ -105,14 +105,14 @@ class ManipLoco_rewards:
         return cost, metric
 
     def _reward_tracking_ee_sphere_walking(self):
-        reward, metric = self.env._reward_tracking_ee_sphere()
+        reward, metric = self._reward_tracking_ee_sphere()
         walking_mask = self.env._get_walking_cmd_mask()
         reward[~walking_mask] = 0
         metric[~walking_mask] = 0
         return reward, metric
 
     def _reward_tracking_ee_sphere_standing(self):
-        reward, metric = self.env._reward_tracking_ee_sphere()
+        reward, metric = self._reward_tracking_ee_sphere()
         walking_mask = self.env._get_walking_cmd_mask()
         reward[walking_mask] = 0
         metric[walking_mask] = 0
@@ -165,13 +165,11 @@ class ManipLoco_rewards:
         return torch.exp(-lin_vel_error/self.env.cfg.rewards.tracking_sigma), lin_vel_error
 
     def _reward_tracking_lin_vel_x_l1(self):
-        zero_cmd_indices = torch.abs(self.env.commands[:, 0]) < 1e-5
         error = torch.abs(self.env.commands[:, 0] - self.env.base_lin_vel[:, 0])
-        rew = 0*error
-        rew_x = -error + torch.abs(self.env.commands[:, 0])
-        rew[~zero_cmd_indices] = rew_x[~zero_cmd_indices] / (torch.abs(self.env.commands[~zero_cmd_indices, 0]) + 0.01)
-        rew[zero_cmd_indices] = 0
-        return rew, error
+        # Keep the public DWBC shaping exactly: this is intentionally not
+        # normalized by the command magnitude and still penalizes drift when
+        # the sampled command is zero.
+        return -error + torch.abs(self.env.commands[:, 0]), error
 
     def _reward_tracking_lin_vel_x_exp(self):
         error = torch.abs(self.env.commands[:, 0] - self.env.base_lin_vel[:, 0])

@@ -185,7 +185,7 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
 
 def get_args(test=False):
     custom_parameters = [
-        {"name": "--task", "type": str, "default": "widowGo1", "help": "Resume training or start testing from a checkpoint. Overrides config file if provided."},
+        {"name": "--task", "type": str, "default": "b1z1", "help": "Resume training or start testing from a checkpoint. Overrides config file if provided."},
         {"name": "--resume", "action": "store_true", "default": False,  "help": "Resume training from a checkpoint"},
         {"name": "--experiment_name", "type": str,  "help": "Name of the experiment to run or load. Overrides config file if provided."},
         {"name": "--run_name", "type": str,  "required": False,  "help": "Name of the run. Overrides config file if provided."},
@@ -195,7 +195,7 @@ def get_args(test=False):
         {"name": "--observe_gait_commands", "action": "store_true", "help": "if observe gait commands, ref to <walk these ways>"},
         {"name": "--disable_5d_base_command", "action": "store_true", "default": False, "help": "Disable 5D base command observation for old checkpoints"},
         {"name": "--disable_arm_base_message", "action": "store_true", "default": False, "help": "Disable arm-to-base message observation for old checkpoints"},
-        {"name": "--allow_arm_policy_action", "action": "store_true", "default": False, "help": "Allow the policy's last 6 actions to drive the arm delta IK controller"},
+        {"name": "--allow_arm_policy_action", "action": "store_true", "default": False, "help": "Deprecated compatibility flag; DWBC always controls all 18 joints"},
         {"name": "--pfg_enabled", "action": "store_true", "default": False, "help": "Enable the PFG feasibility reward"},
         {"name": "--manipulability_enabled", "action": "store_true", "default": False, "help": "Enable the low-manipulability reward"},
         

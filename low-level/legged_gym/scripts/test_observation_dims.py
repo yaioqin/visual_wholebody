@@ -1,7 +1,7 @@
 def expected_num_observations(use_5d_base_command, use_arm_base_message):
-    base_num_proprio = 66
+    base_num_proprio = 72
     history_len = 10
-    num_priv = 18
+    num_priv = 24
     delta_proprio = (2 if use_5d_base_command else 0) + (5 if use_arm_base_message else 0)
     num_proprio = base_num_proprio + delta_proprio
     return num_proprio * (history_len + 1) + num_priv
@@ -9,7 +9,7 @@ def expected_num_observations(use_5d_base_command, use_arm_base_message):
 
 def main():
     history_len = 10
-    original_obs_dim = 66 * (history_len + 1) + 18
+    original_obs_dim = 72 * (history_len + 1) + 24
 
     assert expected_num_observations(False, False) == original_obs_dim
     assert expected_num_observations(True, False) == original_obs_dim + 2 * (history_len + 1)

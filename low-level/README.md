@@ -1,40 +1,76 @@
-# Training a universal low-level policy
+# Deep Whole-Body Control for B1 + Z1
 
-## Code structure
-`legged_gym/envs` contains environment-related codes.
+This branch implements the unified low-level controller from *Deep Whole-Body
+Control: Learning a Unified Policy for Manipulation and Locomotion* on the
+B1 + Z1 model.
 
-`legged_gym/scripts` contains train and test scripts.
+The implementation follows `document/2210.10044v1.pdf` and the public
+`~/lab/Deep-Whole-Body-Control` code:
+
+- one policy emits 12 leg and 6 arm joint-position offsets;
+- both action groups use joint-space PD at 50 Hz over a 200 Hz simulation;
+- separate locomotion/manipulation returns feed two value and log-prob heads;
+- Advantage Mixing linearly reaches full cross-task credit over 3000 updates;
+- a privileged encoder and ten-step history encoder are jointly trained using
+  the regularized online-adaptation objective;
+- rewards and their scales match the public `widowGo1` configuration.
+
+Robot-specific differences are limited to the B1/Z1 URDF, safe default joint
+pose, one passive gripper joint, and the Z1 mount offset used by the spherical
+end-effector command frame.
+
+## Setup
+
+Install Isaac Gym, this package, and the DWBC-compatible RSL-RL fork. In this
+workspace the fork is at `../third_party/rsl_rl`:
+
+```bash
+pip install -e ../third_party/rsl_rl
+pip install -e .
+```
+
+The standard PyPI RSL-RL package is not sufficient because DWBC requires two
+reward/value streams, Advantage Mixing, and the history adaptation module.
 
 ## Train
-
-The environment related code is `legged_gym/legged_gym/envs/manip_loco/manip_loco.py`, and the related config for b1z1 hardware is in `legged_gym/legged_gym/envs/b1z1/b1z1_config.py`.
 
 ```bash
 cd legged_gym/scripts
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-python train.py --headless --exptid MARL_b1_z1 --proj_name b1z1-low --task b1z1 --sim_device cuda:1 --rl_device cuda:1 --observe_gait_commands
+python train.py \
+  --headless \
+  --task b1z1 \
+  --exptid dwbc_b1z1 \
+  --proj_name b1z1-low \
+  --sim_device cuda:0 \
+  --rl_device cuda:0
 ```
-- `--debug` disables wandb and set a small number of envs for faster execution.
-- `--headless` disables rendering, typically used when you train model.
-- `--proj_name` the folder containing all your logs and wandb project name. `manip-loco` is default.
-- `--observe_gait_commands` is for tracking specific gait commands and learning the trotting behavior.
-- `--allow_arm_policy_action` allows the policy's last 6 action dimensions to drive the arm delta IK controller. Without it, the environment zeros those 6 dimensions and PPO updates the leg surrogate only.
 
-To train a whole-body policy with policy-controlled arm motion, start a new run with the arm gate enabled:
+Use `--debug --num_envs 128 --max_iterations 2` for a short smoke run. DWBC
+always learns all 18 actions; no arm-action gate, IK flag, 5-D base command, or
+gait-command flag is required.
+
+## Evaluate
+
+The existing `play.py` return signature and coordination evaluator remain
+supported:
+
 ```bash
-python train.py --headless --exptid MARL_b1_z1_5D_wholebody --proj_name b1z1-low --task b1z1 --sim_device cuda:1 --rl_device cuda:1 --observe_gait_commands --allow_arm_policy_action
+python play.py \
+  --task b1z1 \
+  --exptid dwbc_b1z1 \
+  --proj_name b1z1-low \
+  --checkpoint 40000 \
+  --sim_device cuda:0 \
+  --rl_device cuda:0 \
+  --eval_coordination \
+  --eval_steps 2000
 ```
 
-Check `legged_gym/legged_gym/utils/helpers.py` for all command line args.
+`--flat_terrain` is supported for evaluation. Checkpoints from the earlier
+IK/gated-arm experiments have different observation and action semantics and
+must be evaluated on their original branch; the evaluation APIs themselves are
+kept compatible here.
 
-## Play
-Only need to specify `--exptid`. The parser will automatically find corresponding runs.
-```bash
-cd legged_gym/scripts
-python play.py --exptid MARL_b1_z1_5D_base_command --task b1z1 --proj_name b1z1-low --checkpoint 45000 --sim_device cuda:1 --rl_device cuda:1 --observe_gait_commands
-```
-Use `--sim_device cpu --rl_device cpu` in case not enough GPU memory.
-Use `--allow_arm_policy_action` for checkpoints that were trained with that flag. Base-only checkpoints trained without the flag did not learn meaningful arm actions, so enabling the flag only at play time is not expected to produce a useful arm motion.
-
-## Suggestions
-To choose a good low-level policy that can be further used for training the high-level policy, we suggest you deploy the low-level policy first, and see if it goes well before training a high-level policy.
+Implementation/verification progress is recorded in
+`DWBC_IMPLEMENTATION_STATUS.md`.
