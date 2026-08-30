@@ -101,3 +101,14 @@ python train.py    --exptid MARL_b1_z1_5D_base_command_wo_m_a2b --proj_name b1z1
 
 MARL_b1_z1_5D_base_command_wo_m_a2b
 wandb: Run data is saved locally in /home/xqq/visual_wholebody/low-level/legged_gym/envs/logs/wandb/offline-run-20260702_135353-wgiji6u2
+
+
+
+python play.py --exptid 3D_m_a2b_pfg \
+ --headless \
+ --task b1z1 --proj_name b1z1-low --checkpoint 44000 --sim_device cuda:1 --rl_device cuda:1 \
+ --observe_gait_commands \
+ --eval_coordination \
+ --eval_steps 2000 \
+ --eval_warmup_steps 100 \
+ --eval_out_dir low-level/logs/b1z1-low/3D_m_a2b_pfg/eval_ckpt44000
