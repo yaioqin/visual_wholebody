@@ -240,9 +240,9 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
             feet_height = 1.0
 
             # -------Tracking rewards ----------
-            tracking_lin_vel_max = 2.0 
+            tracking_lin_vel_max = 0.0 # xqq change 2.0->0.0,source:2.0
             tracking_lin_vel_x_l1 = 0.
-            tracking_lin_vel_x_exp = 0
+            tracking_lin_vel_x_exp = 2.0 # xqq change 0.0->2.0,source:0.0
             tracking_ang_vel = 0.5
 
             delta_torques = -1.0e-7/4.0

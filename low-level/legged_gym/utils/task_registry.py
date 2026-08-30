@@ -167,9 +167,10 @@ class TaskRegistry():
             resume_path = get_load_path(log_root, checkpoint=checkpoint)
             print(f"Loading model from: {resume_path}")
             runner.load(resume_path)
-            if checkpoint == -1:
-                checkpoint = int(resume_path.split("_")[-1].split(".")[0])
-            runner.set_it(checkpoint)
+            # runner.load() restores the iteration stored inside the checkpoint.
+            # Keep that value authoritative instead of overwriting it from the
+            # checkpoint filename.
+            checkpoint = runner.current_learning_iteration
             if not train_cfg.policy.continue_from_last_std:
                 runner.alg.actor_critic.reset_std(train_cfg.policy.init_noise_std, 12, device=runner.device)
 

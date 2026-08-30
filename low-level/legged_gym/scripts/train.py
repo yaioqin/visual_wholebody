@@ -35,8 +35,10 @@ import isaacgym
 
 from legged_gym import LEGGED_GYM_ROOT_DIR, LEGGED_GYM_ENVS_DIR
 from legged_gym.envs import *
-from legged_gym.utils.helpers import get_args
+from legged_gym.utils.config_snapshot import save_config_snapshot
+from legged_gym.utils.helpers import class_to_dict, get_args
 from legged_gym.utils.task_registry import task_registry
+from legged_gym.utils.training import remaining_learning_iterations
 import torch
 import wandb
 
@@ -67,7 +69,25 @@ def train(args):
 
     env, env_cfg = task_registry.make_env(name=args.task, args=args)
     ppo_runner, train_cfg, _ = task_registry.make_alg_runner(log_root = log_pth, env=env, name=args.task, args=args)
-    ppo_runner.learn(num_learning_iterations=train_cfg.runner.max_iterations, init_at_random_ep_len=True)
+    config_path = save_config_snapshot(
+        ppo_runner.log_dir,
+        env_cfg=class_to_dict(env_cfg),
+        train_cfg=class_to_dict(train_cfg),
+        args=args,
+    )
+    print(f"Saved effective config to: {config_path}")
+    current_iteration = ppo_runner.current_learning_iteration
+    target_iteration = train_cfg.runner.max_iterations
+    num_learning_iterations = remaining_learning_iterations(target_iteration, current_iteration)
+    print(
+        f"Training target: iteration {target_iteration}; "
+        f"current checkpoint iteration: {current_iteration}; "
+        f"remaining iterations: {num_learning_iterations}"
+    )
+    if num_learning_iterations == 0:
+        print("Checkpoint has already reached the training target; skipping training.")
+        return
+    ppo_runner.learn(num_learning_iterations=num_learning_iterations, init_at_random_ep_len=True)
 
 if __name__ == '__main__':
     args = get_args()
