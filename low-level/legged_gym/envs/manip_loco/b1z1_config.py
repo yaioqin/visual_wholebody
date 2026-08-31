@@ -21,7 +21,7 @@ class B1Z1RoughCfg(B1Z1RoughCfg3D):
         )
 
     class multi_agent:
-        use_arm_base_message = False # False/True
+        use_arm_base_message = True # False/True
 
         use_arm_delta_action = False
         allow_arm_policy_action = False

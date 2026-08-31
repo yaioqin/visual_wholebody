@@ -391,6 +391,37 @@ def _quat_to_euler_xyz(q: torch.Tensor, quat_order: str = "xyzw") -> torch.Tenso
     return torch.stack([roll, pitch, yaw], dim=-1)
 
 
+def quat_to_included_angles(
+    q: torch.Tensor,
+    quat_order: str = "xyzw",
+) -> torch.Tensor:
+    """Return RoboDuet's orientation angles ``[alpha, beta, gamma]``.
+
+    The definition follows Eq. (6) of RoboDuet RAL 2025.  For a rotation
+    matrix ``R``, the three included angles are ``atan2(r21, r11)``,
+    ``atan2(r32, r22)``, and ``atan2(r13, r33)`` respectively.
+    """
+    if q.shape[-1] != 4:
+        raise ValueError("q must have last dimension 4")
+    if quat_order not in ("xyzw", "wxyz"):
+        raise ValueError("quat_order must be 'xyzw' or 'wxyz'")
+
+    q = _normalize_quat(_as_xyzw(q, quat_order))
+    x, y, z, w = q.unbind(-1)
+
+    r11 = 1.0 - 2.0 * (y * y + z * z)
+    r13 = 2.0 * (x * z + y * w)
+    r21 = 2.0 * (x * y + z * w)
+    r22 = 1.0 - 2.0 * (x * x + z * z)
+    r32 = 2.0 * (y * z + x * w)
+    r33 = 1.0 - 2.0 * (x * x + y * y)
+
+    alpha = torch.atan2(r21, r11)
+    beta = torch.atan2(r32, r22)
+    gamma = torch.atan2(r13, r33)
+    return torch.stack([alpha, beta, gamma], dim=-1)
+
+
 def _cart_to_sphere(pos: torch.Tensor) -> torch.Tensor:
     x = pos[:, 0]
     y = pos[:, 1]
@@ -456,6 +487,8 @@ class CoordinationMetrics:
         self.current_episode_success = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self.current_episode_alive = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
         self.current_episode_steps = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self.roboduet_commands_seen = False
+        self.roboduet_move_command_seen = False
 
         self.prev_actions: Optional[torch.Tensor] = None
         self.prev_arm_motion_signal: Optional[torch.Tensor] = None
@@ -467,6 +500,7 @@ class CoordinationMetrics:
         self.history: Dict[str, List[torch.Tensor]] = {}
         self.traj: Dict[str, List[torch.Tensor]] = {}
         self.success_points: List[torch.Tensor] = []
+        self.roboduet_workspace_points: List[torch.Tensor] = []
         self.time_to_success: List[torch.Tensor] = []
 
         self.skipped: List[str] = []
@@ -494,6 +528,11 @@ class CoordinationMetrics:
         all_mask = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
 
         commands = self._get_commands(env)
+        if commands is not None:
+            self.roboduet_commands_seen = True
+            velocity_dims = min(3, commands.shape[-1])
+            if velocity_dims > 0 and torch.any(torch.abs(commands[:, :velocity_dims]) > 1.0e-6).item():
+                self.roboduet_move_command_seen = True
         vx_err, vy_err, yaw_err, vel_l1 = self._update_velocity_metrics(base_lin_vel, base_ang_vel, commands)
 
         base_height = self._get_base_height(env)
@@ -503,6 +542,7 @@ class CoordinationMetrics:
         if base_height is not None:
             fall_mask |= base_height < self.fall_height_thr
             self.acc.add("base_height", base_height)
+            self.acc.add("roboduet_standing", (base_height >= self.fall_height_thr).float())
             self._append_history("base_height", base_height)
             self._append_traj("base_height", base_height)
         else:
@@ -554,6 +594,18 @@ class CoordinationMetrics:
                 self.success_points.append(points[success_mask].detach())
         else:
             self._skip_once("ee/success_rate", "EE position or orientation error unavailable")
+
+        # Workspace is the convex hull of actual, collision-free EE positions.
+        # Tracking error and target orientation do not participate in this
+        # reachability definition.
+        workspace_valid = alive_mask.clone()
+        if reset_event is not None:
+            workspace_valid &= ~reset_event
+        roboduet_points = self._get_roboduet_workspace_actual_pos(env)
+        if roboduet_points is not None:
+            self.roboduet_workspace_points.append(
+                roboduet_points[workspace_valid].detach()
+            )
 
         self._update_episode_metrics(success_mask, alive_mask, reset_event)
         self._update_energy_metrics(env)
@@ -717,6 +769,9 @@ class CoordinationMetrics:
         summary.update(workspace_summary)
         summary["metrics/skipped"] = self.skipped
         summary["metrics/warnings"] = self.warnings
+        # Keep the paper-specific block last so CSV/JSON experiment records
+        # retain all pre-existing fields before the RoboDuet Table III fields.
+        summary.update(self._roboduet_summary())
         return summary
 
     def save(self, out_dir: str, prefix: str = "coordination_eval") -> Dict[str, Optional[str]]:
@@ -727,7 +782,7 @@ class CoordinationMetrics:
         json_path = os.path.join(out_dir, f"{prefix}_{timestamp}.json")
         csv_path = os.path.join(out_dir, f"{prefix}_{timestamp}.csv")
         with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2, sort_keys=True)
+            json.dump(summary, f, indent=2)
         with open(csv_path, "w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["key", "value"])
@@ -954,6 +1009,39 @@ class CoordinationMetrics:
             "EE target orientation",
         )
 
+    def _get_roboduet_workspace_actual_pos(self, env: Any) -> Optional[torch.Tensor]:
+        """Return actual EE positions in the base-yaw-aligned workspace frame."""
+        actual_pos = self._get_ee_actual_pos(env)
+        if actual_pos is None:
+            self._skip_once("roboduet/workspace", "actual EE position not found")
+            return None
+
+        center = None
+        if hasattr(env, "_get_ee_goal_spherical_center"):
+            try:
+                center = env._get_ee_goal_spherical_center()
+            except Exception:
+                center = None
+        center = self._batch_tensor(center, "RoboDuet workspace center")
+        if center is None:
+            center = self._batch_tensor(
+                safe_get_tensor(env, ["ee_goal_center", "ee_goal_center_offset"]),
+                "RoboDuet workspace center",
+            )
+        if center is None:
+            self._skip_once("roboduet/workspace", "workspace center not found")
+            return None
+
+        local_pos = actual_pos[:, :3] - center[:, :3]
+        base_yaw_quat = self._batch_tensor(
+            safe_get_tensor(env, ["base_yaw_quat"]),
+            "base_yaw_quat",
+        )
+        if base_yaw_quat is None or base_yaw_quat.shape[-1] != 4:
+            self._skip_once("roboduet/workspace", "base yaw quaternion not found")
+            return None
+        return _quat_apply_inverse_xyzw(base_yaw_quat, local_pos)
+
     def _get_bool_tensor(self, env: Any, candidates: Iterable[str]) -> Optional[torch.Tensor]:
         tensor = self._batch_tensor(safe_get_tensor(env, candidates), "/".join(candidates))
         if tensor is None:
@@ -1065,8 +1153,18 @@ class CoordinationMetrics:
             return None
         if actual.shape[-1] == 4 and target.shape[-1] == 4:
             ori_err = quat_geodesic_distance(actual[:, :4], target[:, :4], quat_order="xyzw")
+            actual_angles = quat_to_included_angles(actual[:, :4], quat_order="xyzw")
+            target_angles = quat_to_included_angles(target[:, :4], quat_order="xyzw")
+            included_angle_err = torch.abs(angle_wrap_error(actual_angles, target_angles))
+            self.acc.add("ee_ori_alpha_err", included_angle_err[:, 0])
+            self.acc.add("ee_ori_beta_err", included_angle_err[:, 1])
+            self.acc.add("ee_ori_gamma_err", included_angle_err[:, 2])
         elif actual.shape[-1] >= 3 and target.shape[-1] >= 3:
             ori_err = torch.linalg.norm(angle_wrap_error(actual[:, :3], target[:, :3]), dim=-1)
+            included_angle_err = torch.abs(angle_wrap_error(actual[:, :3], target[:, :3]))
+            self.acc.add("ee_ori_alpha_err", included_angle_err[:, 0])
+            self.acc.add("ee_ori_beta_err", included_angle_err[:, 1])
+            self.acc.add("ee_ori_gamma_err", included_angle_err[:, 2])
         else:
             self._skip_once("ee/orientation", "orientation tensors are neither quaternion nor rpy")
             return None
@@ -1356,6 +1454,58 @@ class CoordinationMetrics:
         out["workspace/hull_area_xy"] = hull["hull_area_xy"]
         out["workspace/hull_area_xz"] = hull["hull_area_xz"]
         return out
+
+    def _roboduet_summary(self) -> Dict[str, Any]:
+        """Metrics reported in Table III of RoboDuet RAL 2025.
+
+        Tracking errors and workspace use raw SI values.  Survival is stored as
+        a percentage, as labeled in Table III.  The paper displays tracking and
+        workspace values with an overall 10^-2 table scale.
+        """
+        points = self._cat_history_list(self.roboduet_workspace_points)
+        valid_count = int(points.shape[0]) if points.dim() >= 2 else 0
+        workspace_volume = float("nan")
+        if valid_count < 4:
+            self._skip_once(
+                "roboduet/workspace",
+                "fewer than four valid actual EE positions",
+            )
+        else:
+            hull = compute_convex_hull(points[:, :3].detach().cpu().numpy())
+            if hull is None:
+                self._skip_once("roboduet/workspace", "scipy unavailable")
+            else:
+                workspace_volume = hull["hull_volume"]
+
+        if self.roboduet_commands_seen:
+            mode = "move" if self.roboduet_move_command_seen else "still"
+        else:
+            mode = "unknown"
+        standing_rate = self._scalar(self.acc.mean("roboduet_standing"))
+
+        return {
+            "roboduet/meta/mode": mode,
+            "roboduet/meta/table_iii_display_scale": 1.0e-2,
+            "roboduet/meta/workspace_criterion": "actual_ee_alive_collision_free",
+            "roboduet/velocity/vx_mae_m_s": self._scalar(self.acc.mean("vx_err")),
+            "roboduet/velocity/vy_mae_m_s": self._scalar(self.acc.mean("vy_err")),
+            "roboduet/velocity/omega_z_mae_rad_s": self._scalar(self.acc.mean("yaw_err")),
+            "roboduet/position/l_mae_m": self._scalar(self.acc.mean("ee_sphere_l_err")),
+            "roboduet/position/p_mae_rad": self._scalar(self.acc.mean("ee_sphere_p_err")),
+            "roboduet/position/y_mae_rad": self._scalar(self.acc.mean("ee_sphere_y_err")),
+            "roboduet/position/d_mae_m": self._scalar(self.acc.mean("ee_pos_err")),
+            "roboduet/orientation/alpha_mae_rad": self._scalar(self.acc.mean("ee_ori_alpha_err")),
+            "roboduet/orientation/beta_mae_rad": self._scalar(self.acc.mean("ee_ori_beta_err")),
+            "roboduet/orientation/gamma_mae_rad": self._scalar(self.acc.mean("ee_ori_gamma_err")),
+            "roboduet/orientation/zeta_geodesic_mae_rad": self._scalar(self.acc.mean("ee_ori_err")),
+            "roboduet/survival_rate_percent": 100.0 * standing_rate,
+            "roboduet/workspace_m3": workspace_volume,
+            "roboduet/workspace_valid_points": valid_count,
+            "roboduet/workspace_valid_point_rate": self._safe_ratio(
+                valid_count,
+                self.total_samples,
+            ),
+        }
 
     def _episode_totals(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         active = self.current_episode_steps > 0

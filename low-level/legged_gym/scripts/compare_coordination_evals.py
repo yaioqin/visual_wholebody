@@ -52,6 +52,8 @@ DEFAULT_CHART_METRICS = [
     "workspace/solvability_rate",
     "workspace/hull_volume",
     "workspace/success_points",
+    "roboduet/workspace_m3",
+    "roboduet/workspace_valid_point_rate",
 ]
 
 
@@ -71,6 +73,9 @@ EXPLICIT_DIRECTIONS = {
     "workspace/hull_volume": "higher",
     "workspace/hull_area_xy": "higher",
     "workspace/hull_area_xz": "higher",
+    "roboduet/workspace_m3": "higher",
+    "roboduet/workspace_valid_points": "higher",
+    "roboduet/workspace_valid_point_rate": "higher",
     "stability/base_height_min": "higher",
     "stability/base_height_p05": "higher",
 }
@@ -97,6 +102,7 @@ GROUP_LABELS = {
     "ee": "末端执行器 / end-effector",
     "energy": "能耗 / energy",
     "meta": "评估元信息 / metadata",
+    "roboduet": "RoboDuet 指标 / RoboDuet metrics",
     "smoothness": "动作平滑度 / smoothness",
     "stability": "稳定性 / stability",
     "vel": "速度跟踪 / velocity tracking",
@@ -109,6 +115,7 @@ GROUP_DESCRIPTIONS = {
     "ee": "衡量末端执行器实际位姿和目标位姿之间的误差，以及达到目标的成功率和耗时。",
     "energy": "根据关节力矩和关节速度估算功率或能量；当前臂部能耗可能使用位置控制力矩代理值。",
     "meta": "评估设置本身，不直接代表模型优劣。",
+    "roboduet": "RoboDuet 风格的跟踪、稳定性和实际末端可达工作空间指标。",
     "smoothness": "衡量相邻 step 的 action 或 arm target 变化速度；通常越小代表动作越平滑。",
     "stability": "衡量机器人是否存活、是否摔倒、机身高度和机身加速度等稳定性信号。",
     "vel": "衡量机身实际速度和命令速度之间的跟踪误差。",
@@ -140,6 +147,9 @@ METRIC_EXPLANATIONS = {
     "workspace/hull_volume": "成功末端位置点在 3D 空间中的凸包体积。数值越大，表示成功覆盖的三维工作空间越大。",
     "workspace/hull_area_xy": "成功末端位置点投影到 xy 平面的凸包面积。数值越大，表示水平面成功覆盖范围越大。",
     "workspace/hull_area_xz": "成功末端位置点投影到 xz 平面的凸包面积。数值越大，表示前后-高度平面成功覆盖范围越大。",
+    "roboduet/workspace_m3": "机器人存活且无碰撞时，实际末端位置在机身 yaw 对齐局部坐标系中的三维凸包体积。该指标忽略目标位置误差和末端姿态误差，数值越大表示评估中实际覆盖的可达空间越大。",
+    "roboduet/workspace_valid_points": "用于计算 RoboDuet workspace 的有效 step 数；仅包含机器人存活且无碰撞、并能读取实际末端位置的样本。",
+    "roboduet/workspace_valid_point_rate": "用于计算 RoboDuet workspace 的有效 step 比例，即存活且无碰撞的实际末端位置样本数除以总评估样本数。",
     "meta/num_envs": "并行评估环境数量。它描述评估配置，不代表模型好坏。",
     "meta/eval_steps": "去掉 warmup 后实际纳入统计的 rollout step 数。它描述评估长度，不代表模型好坏。",
     "meta/warmup_steps": "评估前丢弃、不纳入统计的 warmup step 数。它描述评估配置，不代表模型好坏。",

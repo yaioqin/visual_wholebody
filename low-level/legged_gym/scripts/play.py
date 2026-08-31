@@ -78,6 +78,31 @@ def _print_coordination_summary(summary):
     print(f"warnings: {'; '.join(warnings) if warnings else 'none'}")
     print("=============================================")
 
+def _print_roboduet_summary(summary):
+    rows = [
+        ("Velocity vx", "roboduet/velocity/vx_mae_m_s", "m/s"),
+        ("Velocity vy", "roboduet/velocity/vy_mae_m_s", "m/s"),
+        ("Velocity omega_z", "roboduet/velocity/omega_z_mae_rad_s", "rad/s"),
+        ("Position l", "roboduet/position/l_mae_m", "m"),
+        ("Position p", "roboduet/position/p_mae_rad", "rad"),
+        ("Position y", "roboduet/position/y_mae_rad", "rad"),
+        ("Position D", "roboduet/position/d_mae_m", "m"),
+        ("Orientation alpha", "roboduet/orientation/alpha_mae_rad", "rad"),
+        ("Orientation beta", "roboduet/orientation/beta_mae_rad", "rad"),
+        ("Orientation gamma", "roboduet/orientation/gamma_mae_rad", "rad"),
+        ("Orientation zeta", "roboduet/orientation/zeta_geodesic_mae_rad", "rad"),
+        ("Survival Rate", "roboduet/survival_rate_percent", "%"),
+        ("Workspace", "roboduet/workspace_m3", "m^3"),
+    ]
+    mode = summary.get("roboduet/meta/mode", "unknown")
+    print(f"========== RoboDuet Table III Metrics ({mode}) ==========")
+    print("Workspace criterion     : actual EE, alive and collision-free; error ignored")
+    for label, key, unit in rows:
+        value = _format_eval_value(summary.get(key, float("nan")))
+        print(f"{label:<24}: {value} {unit}")
+    print("Paper display scale: 10^-2; tracking/workspace values above use raw SI units.")
+    print("================================================")
+
 def play(args):
     log_pth = LEGGED_GYM_ROOT_DIR + "/logs/{}/".format(args.proj_name) + args.exptid
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
@@ -205,6 +230,7 @@ def play(args):
             out_dir = os.path.join(log_pth, "coordination_eval")
         paths = coordination_metrics.save(out_dir)
         _print_coordination_summary(summary)
+        _print_roboduet_summary(summary)
         print("Saved coordination evaluation to:")
         print(f"  json: {paths['json']}")
         print(f"  csv:  {paths['csv']}")

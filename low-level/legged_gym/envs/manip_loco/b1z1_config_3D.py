@@ -55,12 +55,12 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
             pos_p = [-1 * np.pi / 2.5, 1 * np.pi / 3]
             pos_y = [-1.2, 1.2]
             
-            # delta_orn_r = [-0.5, 0.5] # 原
-            # delta_orn_p = [-0.5, 0.5] # 原
-            # delta_orn_y = [-0.5, 0.5] # 原
-            delta_orn_r = [-1.5, 1.5] # dq_net
-            delta_orn_p = [-1.2, 1.6] # dq_net
-            delta_orn_y = [-0.8, 0.8] # dq_net
+            delta_orn_r = [-0.5, 0.5] # 原
+            delta_orn_p = [-0.5, 0.5] # 原
+            delta_orn_y = [-0.5, 0.5] # 原
+            # delta_orn_r = [-1.5, 1.5] # dq_net
+            # delta_orn_p = [-1.2, 1.6] # dq_net
+            # delta_orn_y = [-0.8, 0.8] # dq_net
             final_tracking_ee_reward = 0.55
 
         sphere_error_scale = [1, 1, 1]#[1 / (ranges.final_pos_l[1] - ranges.final_pos_l[0]), 1 / (ranges.final_pos_p[1] - ranges.final_pos_p[0]), 1 / (ranges.final_pos_y[1] - ranges.final_pos_y[0])]
