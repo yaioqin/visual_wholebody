@@ -380,6 +380,18 @@ class PFGKinematics:
     # ------------------------------------------------------------------
     # Batched FK and Jacobian
     # ------------------------------------------------------------------
+    def jacobian(self, arm_q: torch.Tensor) -> torch.Tensor:
+        """Return the arm geometric Jacobian for a batch of joint poses."""
+        if arm_q.ndim != 2 or arm_q.shape[1] != self.num_arm_joints:
+            raise ValueError(
+                "arm_q must have shape [batch, num_arm_joints], got "
+                f"{tuple(arm_q.shape)}"
+            )
+        _, jacobian = self._forward_and_jacobian(
+            arm_q.to(device=self.device, dtype=self.dtype)
+        )
+        return jacobian
+
     def _forward_and_jacobian(
         self,
         arm_q: torch.Tensor,

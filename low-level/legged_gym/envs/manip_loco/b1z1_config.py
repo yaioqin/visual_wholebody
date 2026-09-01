@@ -21,7 +21,8 @@ class B1Z1RoughCfg(B1Z1RoughCfg3D):
         )
 
     class multi_agent:
-        use_arm_base_message = True # False/True
+        # Runtime value is always overridden by --use_arm_base_message.
+        use_arm_base_message = False
 
         use_arm_delta_action = False
         allow_arm_policy_action = False
@@ -43,6 +44,28 @@ class B1Z1RoughCfg(B1Z1RoughCfg3D):
             "z1_wrist_rotate",
         ]
         ee_body_name = "ee_gripper_link"
+
+    class staged_training:
+        """Two-stage schedule, keyed by the global PPO learning iteration."""
+
+        enabled = True
+        switch_iteration = 37000
+
+        class stage1:
+            name = "original"
+            delta_orn_r = [-0.5, 0.5]
+            delta_orn_p = [-0.5, 0.5]
+            delta_orn_y = [-0.5, 0.5]
+            base_height = -5.0
+            tracking_ee_world = 0.8
+
+        class stage2:
+            name = "dq_net"
+            delta_orn_r = [-1.5, 1.5]
+            delta_orn_p = [-1.2, 1.6]
+            delta_orn_y = [-0.8, 0.8]
+            base_height = -4.0
+            tracking_ee_world = 1.5
 
 
 
@@ -74,6 +97,7 @@ class B1Z1RoughCfg(B1Z1RoughCfg3D):
             enabled = True
             # 防止奇异值为 0 时出现 log(0)
             eps = 1.0e-6
+            # 固定参考值由以下默认机械臂关节姿态确定性计算。
             # 低于默认姿态 manipulability 的 20% 时开始惩罚
             soft_ratio = 0.20
             # 低于默认姿态 manipulability 的 10% 时开始强制惩罚

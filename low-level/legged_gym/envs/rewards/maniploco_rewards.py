@@ -63,18 +63,16 @@ class ManipLoco_rewards:
             dim=-1,
         )
 
-        if (
-            not hasattr(self.env, "manip_log_eta_ref")
-            or self.env.manip_log_eta_ref is None
-        ):
-            self.env.manip_log_eta_ref = torch.median(
-                log_eta.detach()
-            ).clone()
+        if self.env.manip_log_eta_ref is None:
+            raise RuntimeError(
+                "Manipulability reference was not initialized from the "
+                "nominal arm posture"
+            )
 
         eta_ratio = torch.exp(
             torch.clamp(
                 log_eta - self.env.manip_log_eta_ref,
-                min=-20.0,
+                min=float(cfg.min_log_ratio),
                 max=0.0,
             )
         )

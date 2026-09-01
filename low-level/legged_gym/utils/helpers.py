@@ -143,8 +143,12 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
             env_cfg.env.observe_gait_commands = True
         if args.disable_5d_base_command and hasattr(env_cfg.commands, "use_5d_base_command"):
             env_cfg.commands.use_5d_base_command = False
-        if args.disable_arm_base_message and hasattr(env_cfg, "multi_agent"):
-            env_cfg.multi_agent.use_arm_base_message = False
+        if hasattr(env_cfg, "multi_agent"):
+            # This option deliberately does not inherit the config value:
+            # present on the CLI -> True; absent -> False.
+            env_cfg.multi_agent.use_arm_base_message = bool(
+                getattr(args, "use_arm_base_message", False)
+            )
         if args.allow_arm_policy_action and hasattr(env_cfg, "multi_agent"):
             env_cfg.multi_agent.use_arm_delta_action = True
             env_cfg.multi_agent.allow_arm_policy_action = True
@@ -194,7 +198,7 @@ def get_args(test=False):
         {"name": "--stop_update_goal", "action": "store_true", "help": "stop when update a new ee goal"},
         {"name": "--observe_gait_commands", "action": "store_true", "help": "if observe gait commands, ref to <walk these ways>"},
         {"name": "--disable_5d_base_command", "action": "store_true", "default": False, "help": "Disable 5D base command observation for old checkpoints"},
-        {"name": "--disable_arm_base_message", "action": "store_true", "default": False, "help": "Disable arm-to-base message observation for old checkpoints"},
+        {"name": "--use_arm_base_message", "action": "store_true", "default": False, "help": "Enable arm-to-base message observation; disabled when omitted"},
         {"name": "--allow_arm_policy_action", "action": "store_true", "default": False, "help": "Allow the policy's last 6 actions to drive the arm delta IK controller"},
         {"name": "--pfg_enabled", "action": "store_true", "default": False, "help": "Enable the PFG feasibility reward"},
         {"name": "--manipulability_enabled", "action": "store_true", "default": False, "help": "Enable the low-manipulability reward"},

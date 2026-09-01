@@ -36,6 +36,7 @@ import isaacgym
 from legged_gym import LEGGED_GYM_ROOT_DIR, LEGGED_GYM_ENVS_DIR
 from legged_gym.envs import *
 from legged_gym.utils.helpers import get_args
+from legged_gym.utils.staged_training import learn_with_staged_training
 from legged_gym.utils.task_registry import task_registry
 import torch
 import wandb
@@ -64,10 +65,19 @@ def train(args):
     wandb.save(LEGGED_GYM_ENVS_DIR + "/manip_loco/b1z1_config.py", policy="now")
     wandb.save(LEGGED_GYM_ENVS_DIR + "/manip_loco/b1z1_config_3D.py", policy="now")
     wandb.save(LEGGED_GYM_ENVS_DIR + "/manip_loco/manip_loco.py", policy="now")
+    wandb.save(
+        LEGGED_GYM_ROOT_DIR + "/legged_gym/utils/staged_training.py",
+        policy="now",
+    )
 
     env, env_cfg = task_registry.make_env(name=args.task, args=args)
     ppo_runner, train_cfg, _ = task_registry.make_alg_runner(log_root = log_pth, env=env, name=args.task, args=args)
-    ppo_runner.learn(num_learning_iterations=train_cfg.runner.max_iterations, init_at_random_ep_len=True)
+    learn_with_staged_training(
+        runner=ppo_runner,
+        env_cfg=env_cfg,
+        target_iteration=train_cfg.runner.max_iterations,
+        init_at_random_ep_len=True,
+    )
 
 if __name__ == '__main__':
     args = get_args()

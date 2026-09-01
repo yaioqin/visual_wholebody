@@ -58,7 +58,13 @@ class ManipLoco(LeggedRobot):
         multi_agent_cfg = getattr(cfg, "multi_agent", None)
         command_cfg = getattr(cfg, "commands", None)
         pfg_cfg = getattr(getattr(cfg, "rewards", None), "pfg", None)
+        manipulability_cfg = getattr(
+            getattr(cfg, "rewards", None), "manipulability", None
+        )
         self.use_pfg_reward = bool(getattr(pfg_cfg, "enabled", False))
+        self.use_manipulability_reward = bool(
+            getattr(manipulability_cfg, "enabled", False)
+        )
         self.use_arm_delta_action = bool(getattr(multi_agent_cfg, "use_arm_delta_action", False))
         self.allow_arm_policy_action = bool(getattr(multi_agent_cfg, "allow_arm_policy_action", False))
         self.use_policy_arm_delta_action = self.use_arm_delta_action and self.allow_arm_policy_action
@@ -224,6 +230,23 @@ class ManipLoco(LeggedRobot):
 
 
     # >>> PFG REWARD PATCH (3d_m_a2b) >>>
+    def _build_arm_kinematics(self, solver_cfg=None):
+        """Build the URDF arm model shared by PFG and manipulability."""
+        urdf_path = self.cfg.asset.file.format(
+            LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR
+        )
+        arm_limits = self.dof_pos_limits[self.arm_dof_indices_tensor]
+        return PFGKinematics(
+            urdf_path=urdf_path,
+            end_link_name=self.ee_body_name,
+            arm_joint_names=self.arm_dof_names,
+            joint_lower_limits=arm_limits[:, 0],
+            joint_upper_limits=arm_limits[:, 1],
+            device=self.device,
+            dtype=torch.float32,
+            config=solver_cfg,
+        )
+
     def _init_pfg_kinematics(self):
         """Build a separate URDF FK/Jacobian model for virtual PFG IK."""
         self.pfg_kinematics = None
@@ -237,10 +260,6 @@ class ManipLoco(LeggedRobot):
             return
 
         pfg_cfg = self.cfg.rewards.pfg
-        urdf_path = self.cfg.asset.file.format(
-            LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR
-        )
-        arm_limits = self.dof_pos_limits[self.arm_dof_indices_tensor]
         solver_cfg = PFGKinematicsConfig(
             max_iterations=int(pfg_cfg.max_iterations),
             error_tolerance=float(pfg_cfg.error_tolerance),
@@ -249,16 +268,7 @@ class ManipLoco(LeggedRobot):
             max_joint_step=float(pfg_cfg.max_joint_step),
             pose_error_weights=tuple(float(x) for x in pfg_cfg.pose_error_weights),
         )
-        self.pfg_kinematics = PFGKinematics(
-            urdf_path=urdf_path,
-            end_link_name=self.cfg.multi_agent.ee_body_name,
-            arm_joint_names=self.cfg.multi_agent.arm_dof_names,
-            joint_lower_limits=arm_limits[:, 0],
-            joint_upper_limits=arm_limits[:, 1],
-            device=self.device,
-            dtype=torch.float32,
-            config=solver_cfg,
-        )
+        self.pfg_kinematics = self._build_arm_kinematics(solver_cfg)
 
         current_arm_q = self.dof_pos[:, self.arm_dof_indices_tensor].clone()
         self.pfg_q_ideal = current_arm_q
@@ -286,6 +296,61 @@ class ManipLoco(LeggedRobot):
             f"root={self.pfg_kinematics.root_link_name}, "
             f"joints={self.pfg_kinematics.chain_joint_names}"
         )
+
+    @torch.no_grad()
+    def _init_manipulability_reference(self):
+        """Compute a deterministic manipulability reference at nominal arm q."""
+        self.manip_log_eta_ref = None
+        self.manip_eta_ref = None
+        self.manip_ref_min_singular_value = None
+
+        if not self.use_manipulability_reward:
+            return
+
+        cfg = self.cfg.rewards.manipulability
+        eps = float(cfg.eps)
+        if not np.isfinite(eps) or eps <= 0.0:
+            raise ValueError(f"manipulability.eps must be positive, got {eps}")
+        if not 0.0 < float(cfg.critical_ratio) < float(cfg.soft_ratio) < 1.0:
+            raise ValueError(
+                "manipulability ratios must satisfy "
+                "0 < critical_ratio < soft_ratio < 1"
+            )
+        if float(cfg.min_log_ratio) > 0.0:
+            raise ValueError("manipulability.min_log_ratio must be <= 0")
+
+        # Reuse the PFG model when available. Otherwise build the same URDF
+        # model temporarily; the reference depends only on kinematics.
+        kinematics = self.pfg_kinematics
+        if kinematics is None:
+            kinematics = self._build_arm_kinematics()
+
+        nominal_q = torch.tensor(
+            [
+                self.cfg.init_state.default_joint_angles[name]
+                for name in self.arm_dof_names
+            ],
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)
+        nominal_jacobian = kinematics.jacobian(nominal_q)
+        singular_values = torch.linalg.svdvals(nominal_jacobian)
+        min_singular_value = singular_values.amin()
+
+        if not bool(torch.isfinite(singular_values).all()):
+            raise RuntimeError(
+                "Nominal arm Jacobian contains non-finite singular values"
+            )
+        if float(min_singular_value) <= eps:
+            raise RuntimeError(
+                "Nominal arm posture is singular or too close to singular: "
+                f"sigma_min={float(min_singular_value):.6g}, eps={eps:.6g}"
+            )
+
+        log_eta_ref = torch.log(singular_values).sum(dim=-1).squeeze(0)
+        self.manip_log_eta_ref = log_eta_ref.detach().clone()
+        self.manip_eta_ref = torch.exp(log_eta_ref).detach().clone()
+        self.manip_ref_min_singular_value = min_singular_value.detach().clone()
 
     def _reset_pfg_buffers(self, env_ids):
         if (
@@ -583,6 +648,8 @@ class ManipLoco(LeggedRobot):
         self.obs_scales = self.cfg.normalization.obs_scales
         self.reward_scales = class_to_dict(self.cfg.rewards.scales)
         self.arm_reward_scales = class_to_dict(self.cfg.rewards.arm_scales)
+        if not self.use_manipulability_reward:
+            self.reward_scales["low_manipulability"] = 0.0
         self.command_ranges = class_to_dict(self.cfg.commands.ranges)
         self.goal_ee_ranges = class_to_dict(self.cfg.goal_ee.ranges)
 
@@ -1022,6 +1089,7 @@ class ManipLoco(LeggedRobot):
         self.ee_vel = self.rigid_body_state[:, self.gripper_idx, 7:]
         self.ee_j_eef = self.get_arm_jacobian(refresh=False)
         self._init_pfg_kinematics()
+        self._init_manipulability_reference()
         chunk_horizon = getattr(getattr(self.cfg, "multi_agent", None), "arm_chunk_horizon", 1)
         assert chunk_horizon == 1, "Current low-level training expects arm_chunk_horizon == 1"
         self.prev_arm_action_chunk = torch.zeros(self.num_envs, chunk_horizon, 6, device=self.device)
@@ -1433,16 +1501,31 @@ class ManipLoco(LeggedRobot):
         return clipped
 
     def get_arm_jacobian(self, refresh=True):
-        """
-        Returns:
-            J_arm: Tensor[num_envs, 6, 6]
-        """
         if refresh:
             self.gym.refresh_jacobian_tensors(self.sim)
-        j_ee = self.jacobian_whole[:, self.ee_body_idx, :6, :]
-        j_arm = j_ee.index_select(-1, self.arm_dof_indices_tensor)
-        assert j_arm.shape == (self.num_envs, 6, 6), j_arm.shape
+
+        jacobian = self.jacobian_whole
+
+        if jacobian.shape[-1] == self.num_dofs + 6:
+            # Floating base
+            body_idx = self.ee_body_idx
+            dof_indices = self.arm_dof_indices_tensor + 6
+        elif jacobian.shape[-1] == self.num_dofs:
+            # Fixed base: root body does not have a Jacobian row
+            body_idx = self.ee_body_idx - 1
+            dof_indices = self.arm_dof_indices_tensor
+        else:
+            raise RuntimeError(
+                f"Unexpected Jacobian shape {tuple(jacobian.shape)}, "
+                f"num_dofs={self.num_dofs}"
+            )
+
+        j_arm = jacobian[:, body_idx, :, :].index_select(-1, dof_indices)
+
+        expected_shape = (self.num_envs, 6, 6)
+        assert j_arm.shape == expected_shape, j_arm.shape
         assert torch.isfinite(j_arm).all()
+
         self.ee_j_eef = j_arm
         return j_arm
 
