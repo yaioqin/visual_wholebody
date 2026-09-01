@@ -30,9 +30,18 @@
 
 from .manip_loco.manip_loco import ManipLoco
 from .manip_loco.b1z1_config import B1Z1RoughCfg, B1Z1RoughCfgPPO
+from .manip_loco.b2z1_config import B2Z1RoughCfg, B2Z1RoughCfgPPO, B2Z1BoundedActionsCfg, B2Z1BoundedActionsCfgPPO, B2Z1AggressiveLocomotionCfg, B2Z1AggressiveLocomotionCfgPPO, B2Z1ReachableWorkspaceCfg, B2Z1ReachableWorkspaceCfgPPO, B2Z1ReachableWorkspaceMotionCfg, B2Z1ReachableWorkspaceMotionCfgPPO, B2Z1ReachableWorkspaceMotionPlusCfg, B2Z1ReachableWorkspaceMotionPlusCfgPPO, B2Z1ReachableBalancedCfg, B2Z1ReachableBalancedCfgPPO
 
 import os
 
 from legged_gym.utils.task_registry import task_registry
 
 task_registry.register( "b1z1", ManipLoco, B1Z1RoughCfg(), B1Z1RoughCfgPPO(), 'b1z1')
+task_registry.register( "b2z1", ManipLoco, B2Z1RoughCfg(), B2Z1RoughCfgPPO(), 'b2z1')
+task_registry.register( "b2_z1", ManipLoco, B2Z1RoughCfg(), B2Z1RoughCfgPPO(), 'b2z1')
+task_registry.register( "b2_z1_bounded_actions", ManipLoco, B2Z1BoundedActionsCfg(), B2Z1BoundedActionsCfgPPO(), 'b2z1')
+task_registry.register( "b2_z1_aggressive_locomotion", ManipLoco, B2Z1AggressiveLocomotionCfg(), B2Z1AggressiveLocomotionCfgPPO(), 'b2z1')
+task_registry.register( "b2_z1_reachable_workspace", ManipLoco, B2Z1ReachableWorkspaceCfg(), B2Z1ReachableWorkspaceCfgPPO(), 'b2z1')
+task_registry.register( "b2_z1_reachable_workspace_motion", ManipLoco, B2Z1ReachableWorkspaceMotionCfg(), B2Z1ReachableWorkspaceMotionCfgPPO(), 'b2z1')
+task_registry.register( "b2_z1_reachable_workspace_motion_plus", ManipLoco, B2Z1ReachableWorkspaceMotionPlusCfg(), B2Z1ReachableWorkspaceMotionPlusCfgPPO(), 'b2z1')
+task_registry.register( "b2_z1_reachable_balanced", ManipLoco, B2Z1ReachableBalancedCfg(), B2Z1ReachableBalancedCfgPPO(), 'b2z1')

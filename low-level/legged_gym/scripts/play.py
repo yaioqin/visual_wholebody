@@ -52,7 +52,9 @@ def play(args):
 
     env_cfg.terrain.num_rows = 6
     env_cfg.terrain.num_cols = 3
-    # env_cfg.env.episode_length_s = 10000
+    # Use a long episode so a 30s+ recording is one continuous take (no
+    # episode timeout resets every episode_length_s seconds).
+    env_cfg.env.episode_length_s = max(env_cfg.env.episode_length_s, args.video_length + 5)
     env_cfg.domain_rand.push_robots = False
     # env_cfg.domain_rand.push_interval_s = 2
     env_cfg.domain_rand.randomize_base_mass = True #False
@@ -116,7 +118,7 @@ def play(args):
     if not args.record_video:
         traj_length = 1000*int(env.max_episode_length)
     else:
-        traj_length = int(env.max_episode_length)
+        traj_length = int(args.video_length / env.dt)
 
     # env.update_command_curriculum()
     env.reset()
@@ -137,6 +139,14 @@ def play(args):
 
         duration = stop_time - start_time
         time.sleep(max(0.02 - duration, 0))
+        if i % 50 == 0:
+            print(
+                "cmd", env.commands[0, :3].detach().cpu().numpy(),
+                "lin", env.base_lin_vel[0, :3].detach().cpu().numpy(),
+                "yaw", env.base_ang_vel[0, 2].item(),
+                "act_leg_abs", actions[0, :12].abs().mean().item(),
+                "tau_leg_abs", env.torques[0, :12].abs().mean().item(),
+            )
 
     if args.record_video:
         for mp4_writer in mp4_writers:

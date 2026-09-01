@@ -164,6 +164,7 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
 
     class asset( LeggedRobotCfg.asset ):
         file = '{LEGGED_GYM_ROOT_DIR}/resources/robots/b1z1/urdf/b1z1.urdf'
+        base_name = "trunk"
         foot_name = "foot"
         gripper_name = "ee_gripper_link" #"gripperMover"
         penalize_contacts_on = ["thigh", "trunk", "calf"]
@@ -182,6 +183,7 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
         box_env_origins_z = box_size / 2 + 0.16
     
     class arm:
+        base_offset = [0.3, 0.0, 0.09]
         init_target_ee_base = [0.2, 0.0, 0.2]
         grasp_offset = 0.08
         osc_kp = np.array([100, 100, 100, 30, 30, 30])
@@ -231,8 +233,8 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
         # To not compute and log a given metric, set the scale to None
         class scales:
             # -------Gait control rewards ---------
-            tracking_contacts_shaped_force = -2.0 # Only works when `observing_gait_commands` is true
-            tracking_contacts_shaped_vel = -2.0 # Only works when `observing_gait_commands` is true
+            tracking_contacts_shaped_force = -0.2 # Only works when `observing_gait_commands` is true
+            tracking_contacts_shaped_vel = -0.2 # Only works when `observing_gait_commands` is true
             feet_air_time = 2.0
             feet_height = 1.0
 
@@ -257,7 +259,7 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
             # common rewards
             ang_vel_xy = -0.2 
             dof_acc = -7.5e-7 
-            collision = -10.
+            collision = -0.001
             action_rate = -0.015
             dof_pos_limits = -10.0
             delta_torques = -1.0e-7
@@ -401,7 +403,7 @@ class B1Z1RoughCfgPPO(LeggedRobotCfgPPO):
         num_steps_per_env = 24
         max_iterations = 45000 # number of policy updates
         # logging
-        save_interval = 200 # check for potential saves every this many iterations
+        save_interval = 2000 # check for potential saves every this many iterations
         experiment_name = 'b1z1_v2'
         run_name = ''
         # load and resume

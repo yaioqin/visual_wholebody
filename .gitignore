@@ -17,6 +17,7 @@ IsaacGymEnvs/
 **events*
 **/*.pt
 **/*.log
+**/*.pid
 **/.idea
 **/*.egg-info
 **/.pytest_cache

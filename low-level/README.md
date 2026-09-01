@@ -12,7 +12,7 @@ The environment related code is `legged_gym/legged_gym/envs/manip_loco/manip_loc
 ```bash
 cd legged_gym/scripts
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-python train.py --headless --exptid SOME_YOUR_DESCRIPTION --proj_name b1z1-low --task b1z1 --sim_device cuda:1 --rl_device cuda:1 --observe_gait_commands
+python train.py --headless --exptid b1_z1_source --proj_name b1z1-low --task b1z1 --sim_device cuda:0 --rl_device cuda:0 --observe_gait_commands
 ```
 - `--debug` disables wandb and set a small number of envs for faster execution.
 - `--headless` disables rendering, typically used when you train model.
@@ -29,5 +29,6 @@ python play.py --exptid SOME_YOUR_DESCRIPTION --task b1z1 --proj_name b1z1-low -
 ```
 Use `--sim_device cpu --rl_device cpu` in case not enough GPU memory.
 
+更多运行指令请见：run_cmd.txt
 ## Suggestions
 To choose a good low-level policy that can be further used for training the high-level policy, we suggest you deploy the low-level policy first, and see if it goes well before training a high-level policy.

@@ -196,12 +196,13 @@ class PPO:
 
 
                 # Surrogate loss
-                only_train_leg = False
+                # The environment executes the 12 leg actions; the arm follows
+                # end-effector goals through IK and must not enter the PPO ratio.
+                only_train_leg = True
 
                 mixing_advantages_batch = torch.zeros_like(advantages_batch)
                 if only_train_leg == True:
-                    mixing_advantages_batch[..., 0] = advantages_batch[..., 0]
-                    mixing_advantages_batch[..., 1] = advantages_batch[..., 1]
+                    mixing_advantages_batch[..., 0] = advantages_batch[..., 0] + value_mixing_ratio * advantages_batch[..., 1]
                 else:
                     mixing_advantages_batch[..., 0] = advantages_batch[..., 0] + value_mixing_ratio * advantages_batch[..., 1]
                     mixing_advantages_batch[..., 1] = advantages_batch[..., 1] + value_mixing_ratio * advantages_batch[..., 0]
@@ -330,4 +331,3 @@ class PPO:
         arm_torques = fixed_arm_p_gains * (target_arm_dof_pos + self.default_arm_dof_pos - current_arm_dof_pos) \
             - fixed_arm_d_gains * current_arm_dof_vel
         return arm_torques
-

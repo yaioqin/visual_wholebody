@@ -1,5 +1,6 @@
 import torch
 from isaacgym.torch_utils import *
+from legged_gym.utils.math import cart2sphere
 
 class ManipLoco_rewards:
     def __init__(self, env):
@@ -44,7 +45,10 @@ class ManipLoco_rewards:
         return torch.exp(-orn_err/self.env.cfg.rewards.tracking_ee_sigma), orn_err
 
     def _reward_arm_energy_abs_sum(self):
-        energy = torch.sum(torch.abs(self.env.torques[:, 12:-self.env.cfg.env.num_gripper_joints] * self.env.dof_vel[:, 12:-self.env.cfg.env.num_gripper_joints]), dim = 1)
+        controlled_slice = self.env._slice_without_gripper()
+        arm_torques = self.env.torques[:, controlled_slice][:, 12:]
+        arm_vel = self.env.dof_vel[:, controlled_slice][:, 12:]
+        energy = torch.sum(torch.abs(arm_torques * arm_vel), dim = 1)
         return energy, energy
 
     def _reward_tracking_ee_orn_ry(self):
@@ -226,7 +230,10 @@ class ManipLoco_rewards:
     
     def _reward_base_height(self):
         # Penalize base height away from target
-        base_height = torch.mean(self.env.root_states[:, 2].unsqueeze(1), dim=1)
+        base_height = torch.mean(
+            self.env.root_states[:, 2].unsqueeze(1) - self.env.measured_heights,
+            dim=1,
+        )
         return torch.abs(base_height - self.env.cfg.rewards.base_height_target), base_height
     
     def _reward_orientation_walking(self):
@@ -317,7 +324,7 @@ class ManipLoco_rewards:
 
         reward = 0
         for i in range(4):
-            reward += - (1 - desired_contact[:, i]) * (
+            reward += (1 - desired_contact[:, i]) * (
                         1 - torch.exp(-1 * foot_forces[:, i] ** 2 / self.env.cfg.rewards.gait_force_sigma))
         
         # cmd_stop_flag = ~self.env._get_walking_cmd_mask()
@@ -331,8 +338,8 @@ class ManipLoco_rewards:
         desired_contact = self.env.desired_contact_states
         reward = 0
         for i in range(4):
-            reward += - (desired_contact[:, i] * (
-                        1 - torch.exp(-1 * foot_velocities[:, i] ** 2 / self.env.cfg.rewards.gait_vel_sigma)))
+            reward += desired_contact[:, i] * (
+                        1 - torch.exp(-1 * foot_velocities[:, i] ** 2 / self.env.cfg.rewards.gait_vel_sigma))
         # cmd_stop_flag = ~self.env._get_walking_cmd_mask()
         # reward[cmd_stop_flag] = 0
         

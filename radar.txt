@@ -1,0 +1,1275 @@
+# B2-Z1 雷达遮挡下的 Whole-Body Reachable 方案
+
+## 总体思路
+
+保留当前论文兼容的控制结构：
+
+- 策略仍只实际控制前 12 维腿部动作；
+- 后 6 维 arm action 继续 mask 为 0；
+- 机械臂仍由 EE 目标和 DLS IK 控制；
+- 身体姿态通过腿部策略调整；
+- arm reward 通过现有 `arm advantage -> leg PPO` 路径影响腿部策略。
+
+本次重点不是简单增大 `mixing_ratio`，而是补齐以下闭环：
+
+```text
+雷达/连杆碰撞检测
+-> 判断当前路径是否可行
+-> 可行时正常跟踪
+-> 不可行时暂停目标推进并给身体恢复窗口
+-> IK/EE reward 反馈身体调整效果
+-> 身体姿态恢复后继续跟踪
+```
+
+## 1. 碰撞与路径参考
+
+### 雷达几何
+
+把 B2 URDF 中 `base_link` 的前方圆柱碰撞体作为雷达：
+
+```text
+center = [0.34218, 0, 0.15851]  # base_link 局部坐标
+radius = 0.076
+height = 0.16
+safety_margin = 0.03
+```
+
+碰撞计算使用膨胀后的圆柱，安全半径为 `0.106 m`，安全半高为 `0.11 m`。
+
+机械臂 `link00` 到 `gripperMover` 使用 URDF 碰撞几何转换为保守的 capsule/sphere 近似。运行时只在初始化阶段解析 URDF，之后在 GPU 上批量计算：
+
+- 每个机械臂连杆采样点到雷达圆柱的距离；
+- 末端到雷达的距离；
+- 当前机械臂最小安全距离；
+- 当前身体姿态下的路径碰撞风险。
+
+不新增独立雷达 actor，不改变 Isaac Gym 的场景结构。
+
+### 目标采样
+
+目标点如果本身位于膨胀后的雷达碰撞体内，直接拒绝并重新采样。最多尝试 64 次；仍失败时保留上一个合法目标，并记录 `invalid_goal_sample`。
+
+目标点在雷达外部但直线插值穿过雷达时，不拒绝目标，因为这种情况应该由 whole-body controller 通过绕行或身体调整解决。
+
+### 路径参考
+
+对当前 EE 到目标点的路径进行 32 个采样点检测：
+
+1. 先检查直线路径；
+2. 若直线穿过雷达，生成四类候选绕行路径：
+   - 左侧绕行；
+   - 右侧绕行；
+   - 上方绕行；
+   - 下方绕行；
+3. 每个候选路径都检查：
+   - EE 路径是否碰撞；
+   - 机械臂连杆近似体是否碰撞；
+   - 关节位置是否超限；
+   - 最小 clearance 是否大于 `0.03 m`；
+4. 选择最短且 clearance 最大的合法路径。
+
+这一步只负责生成安全 EE 参考，不替代腿部策略，也不直接求解全身关节。
+
+### 当前姿态下无安全路径
+
+如果当前身体姿态下没有合法的机械臂绕行路径：
+
+- 保持机械臂在最后一个安全 EE reference；
+- 暂停 `goal_timer`，不继续把目标推进到雷达另一侧；
+- 设置 `goal_blocked = 1`；
+- 给腿部策略保留最多 `2.0 s` 的身体恢复窗口；
+- 如果身体姿态恢复后出现合法路径，继续执行；
+- 如果 2 秒后仍不可行，记录一次 `goal_recovery_timeout`，对该目标施加失败惩罚并重新采样，不直接终止整个 episode。
+
+这样可以避免机械臂被迫沿着必然穿过雷达的轨迹运动，同时允许腿部先蹲下、俯仰或横滚。
+
+## 2. Actor/Critic 观测
+
+在现有观测后追加以下 10 个量，并同时加入 actor 和 critic：
+
+```text
+goal_relative_to_radar      3
+ee_relative_to_radar        3
+min_arm_radar_clearance     1
+direct_path_blocked         1
+ik_position_residual        1
+recovery_phase               1
+```
+
+具体含义：
+
+- 最终目标相对于雷达中心的位置；
+- 当前 EE 相对于雷达中心的位置；
+- 当前机械臂最小 clearance；
+- 直线路径是否被雷达阻挡；
+- 当前 IK 的位置残差；
+- 是否处于身体恢复阶段。
+
+同时更新：
+
+- `num_proprio`；
+- `num_observations`；
+- history buffer 维度；
+- noise scale vector；
+- replay/video 脚本中的 observation 构造。
+
+这些量全部是当前仿真状态或当前目标的函数，不使用未来动作和未来姿态。
+
+## 3. Reward 设计
+
+### 保留现有 reward
+
+保留：
+
+```text
+arm_scales.tracking_ee_world = 0.8
+```
+
+并确保 `tracking_ee_world` 不再出现在腿部 `rewards.scales`，避免同一 EE reward 重复累计。
+
+保留现有：
+
+```text
+mixing_schedule = [0.5, 2000, 2000]
+```
+
+第一轮不直接把 mixing ratio 提高到 1.0，因为当前失败不能仅归因于 mixing 太小；必须先让 arm advantage 获得正确的碰撞和恢复信号。
+
+### 新增 arm-only reward
+
+新增三个机械臂 reward，只放在 `arm_scales`：
+
+```text
+tracking_ee_final_blocked = 0.8
+radar_clearance_violation = -1.0
+recovery_progress = 0.5
+```
+
+含义：
+
+1. `tracking_ee_final_blocked`
+
+   只在 `goal_blocked=1` 时生效，计算当前 EE 到最终目标的误差，而不是到暂时保持的安全 reference 的误差。这样即使机械臂被暂时停在安全位置，腿部仍然能收到“最终目标没有完成”的信号。
+
+2. `radar_clearance_violation`
+
+   对最小 clearance 低于 `0.03 m` 的部分施加归一化惩罚。该项防止策略通过直接撞击雷达换取 EE tracking reward。
+
+3. `recovery_progress`
+
+   根据以下势函数的改善给奖励：
+
+   ```text
+   final_goal_error 是否下降
+   min_clearance 是否增加
+   ik_residual 是否下降
+   ```
+
+   只奖励相对上一个控制周期的改善，不奖励单纯大幅摆腿。
+
+### PPO 处理
+
+保留现有 additive mixing：
+
+```text
+leg_advantage + mixing_ratio * arm_advantage
+```
+
+同时新增日志：
+
+```text
+arm_advantage_mean/std
+leg_advantage_mean/std
+goal_blocked_rate
+recovery_progress
+recovery_timeout_rate
+```
+
+如果第一轮训练在碰撞率已下降但身体恢复仍不足，再进行唯一一轮受控对照：
+
+```text
+mixing_schedule = [1.0, 1000, 2000]
+```
+
+其他配置、随机种子和目标序列保持一致，用于判断是否确实需要更大的 arm advantage。
+
+## 4. 训练配置
+
+由于观测维度改变，旧 checkpoint 不兼容，必须从零开始训练。
+
+新实验名：
+
+```text
+b2_z1_reachable_collision_wholebody_6144_20260821
+```
+
+配置：
+
+```text
+num_envs = 6144
+GPU = cuda:0
+conda environment = b1z1
+max_iterations = 45000
+save_interval = 500
+```
+
+只启动一个训练进程，避免影响其他训练任务和 GPU 显存。
+
+旧的：
+
+```text
+b2_z1_reachable_workspace_6144_20260808
+b2_z1_reachable_balanced_6144_20260808
+```
+
+日志和 checkpoint 全部保留，不覆盖。
+
+## 5. 验证与验收
+
+### 几何单元测试
+
+覆盖：
+
+- 目标点位于雷达内部时被拒绝；
+- 正前方目标但直线路径穿雷达时被标记为 blocked；
+- 左绕、右绕、上绕、下绕路径的合法性判断；
+- 机械臂连杆而非只有 EE 点撞雷达时能被检测；
+- 身体高度变化后 clearance 和路径状态会重新计算。
+
+### 固定场景回放
+
+至少测试以下目标切换：
+
+```text
+右侧 -> 左侧
+左侧 -> 右侧
+正前方上方 -> 正前方下方
+正前方下方 -> 侧面
+```
+
+其中正前方场景必须选择“目标点在雷达外部、直线路径被雷达挡住”的目标，不能把目标点放在雷达碰撞体内部。
+
+每个场景运行 200 个 episode，记录：
+
+```text
+最终 EE 误差
+目标成功率
+最小雷达 clearance
+连杆碰撞次数
+goal_blocked_rate
+平均恢复时间
+base height/pitch/roll 变化
+腿部 tracking reward
+locomotion reward
+```
+
+验收标准：
+
+- 目标点内部采样率为 0；
+- 机械臂连杆与雷达的解析碰撞次数为 0；
+- 正前方遮挡场景成功率相对当前 checkpoint 提升至少 30%；
+- 成功样本的最终 EE 误差小于 `0.08 m`；
+- 恢复阶段平均不超过 `1.5 s`；
+- locomotion 失败率和姿态终止率不比当前模型增加超过 10%。
+
+视频回放中额外显示：
+
+- 雷达圆柱；
+- 机械臂当前路径；
+- 选中的绕行 waypoint；
+- 当前最小 clearance；
+- `goal_blocked` 和 recovery timer。
+
+## 假设与边界
+
+- 雷达被视为固定在 B2 `base_link` 上的圆柱；
+- 目标点在雷达内部时定义为物理不可达目标，不要求策略强行完成；
+- 纯平移不作为主要恢复动作，因为当前目标中心的 `x/y` 跟随 base；重点观察 base 高度、pitch、roll 以及机械臂绕行；
+- 不解放 arm 后 6 维动作；
+- 不引入外部全身求解器；
+- 碰撞模块只生成安全参考和 reward/observation 信号，身体姿态仍由 PPO 学习。
+
+已按方案完成代码修改，未启动训练进程，也未影响现有模型。
+
+主要改动：
+
+- `B2Z1ReachableBalancedCfg`
+  - `feet_height = 1.0`
+  - `feet_height_target = 0.3`
+  - `walking_dof = 0.5`
+  - 使用 aggressive 工作空间：`x_offset=0.2`、`pos_l=[0.45,0.95]`、`pos_y=[-0.75,0.75]`
+  - 保留 `grasp_offset=0.086` 和 grasp point EE 定义
+  - `mixing_schedule = [1.0, 0, 3000]`
+  - checkpoint 保存间隔为 `500`
+  - 新实验名为 `b2_z1_reachable_collision_wholebody_6144_20260821`
+  - 相关配置见 [b2z1_config.py:160](/root/rivermind-data/visual_wholebody/low-level/legged_gym/envs/manip_loco/b2z1_config.py:160)
+
+- 雷达遮挡恢复机制
+  - 解析 B2 URDF 中的雷达 cylinder 几何
+  - 对目标点和 EE 路径进行雷达碰撞检测
+  - 使用双 waypoint 绕行，避免左右切换时第二段路径再次穿过雷达
+  - 无可行路径时冻结安全 EE reference，让 whole-body reward 促使腿部/身体调整
+  - 增加雷达状态观测和恢复状态指标
+  - 相关实现见 [manip_loco.py:1398](/root/rivermind-data/visual_wholebody/low-level/legged_gym/envs/manip_loco/manip_loco.py:1398)
+
+- EE reward
+  - 保留最终目标 tracking reward
+  - 增加雷达 clearance penalty 和 recovery progress reward
+  - reward 仍通过 arm advantage mixing 影响腿部 PPO
+  - 相关实现见 [maniploco_rewards.py:23](/root/rivermind-data/visual_wholebody/low-level/legged_gym/envs/rewards/maniploco_rewards.py:23)
+
+- 修复了两个运行时问题：
+  - URDF collision origin 偏移没有计入 link 包围半径
+  - 0-D tensor 半径广播和 `direct_path_blocked` bool 类型错误
+  - 修复 batch 中一个环境 waypoint 提前 `return` 导致其他环境跳过规划的问题
+
+验证已通过：
+
+- 三个修改文件和 PPO 文件 `py_compile`
+- resolved config 检查
+- `[1.0, 0, 3000]` mixing 在 0、1500、3000 iteration 的比例检查
+- CPU 雷达几何、双 waypoint、无路由情况、多环境 batch 测试
+- 所有历史 PID 对应进程当前均已退出
+
+当前 `b1z1` 环境仍无法启动 Isaac Gym：缺少 `libpython3.8.so.1.0`，并且 CUDA device count 为 0。因此本轮只完成代码和离线验证，没有启动 6144 环境训练。
+
+
+3 files changed
++523
+-83
+low-level/legged_gym/envs/manip_loco/manip_loco.py
+    def __init__(self, cfg, *args, **kwargs):
+        if getattr(cfg.env, "observe_radar_state", False):
+            cfg.env.num_proprio += 10
+        if cfg.env.observe_gait_commands:
+        self.gripper_idx = self.body_names_to_idx[self.cfg.asset.gripper_name]
+        arm_body_names = ["link00", "link01", "link02", "link03", "link04", "link05", "link06", "gripperStator", "gripperMover"]
+        self.arm_body_indices = torch.tensor(
+            [self.body_names_to_idx[name] for name in arm_body_names if name in self.body_names],
+            dtype=torch.long,
+            device=self.device,
+        )
+
+
+        self.radar_center_local = torch.tensor(
+            getattr(self.cfg.goal_ee, "radar_center_local", [0.34218, 0.0, 0.15851]),
+            device=self.device,
+            dtype=torch.float,
+        )
+        self.radar_radius = float(getattr(self.cfg.goal_ee, "radar_radius", 0.076))
+        self.radar_half_height = float(getattr(self.cfg.goal_ee, "radar_half_height", 0.08))
+        self.radar_margin = float(getattr(self.cfg.goal_ee, "radar_margin", 0.03))
+        self.arm_collision_radius = float(getattr(self.cfg.goal_ee, "arm_collision_radius", 0.045))
+        self.radar_clearance = torch.zeros(self.num_envs, device=self.device)
+        self.goal_blocked = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.direct_path_blocked = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.waypoint_active = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.ee_waypoint_world = self.ee_pos.clone()
+        self.final_ee_goal_cart_world = self.curr_ee_goal_cart_world.clone()
+        self.ik_position_residual = torch.zeros(self.num_envs, device=self.device)
+        self.recovery_timer = torch.zeros(self.num_envs, device=self.device)
+        self.previous_recovery_error = torch.zeros(self.num_envs, device=self.device)
+        self.previous_recovery_clearance = torch.zeros(self.num_envs, device=self.device)
+
+        print('------------------------------------------------------')
+        self.ee_goal_sphere[env_ids, 2] = torch_rand_float(self.goal_ee_ranges["pos_y"][0], self.goal_ee_ranges["pos_y"][1], (len(env_ids), 1), device=self.device).squeeze(1)
+
+    def _radar_clearance_for_points(self, points_world, extra_radius=0.0):
+        """Signed clearance of world points from the B2 base-mounted radar cylinder."""
+        num_points = points_world.shape[1]
+        base_quat = self.base_quat[:, None, :].expand(-1, num_points, -1).reshape(-1, 4)
+        radar_center_world = self.base_pos + quat_apply(self.base_quat, self.radar_center_local[None, :])
+        local = quat_rotate_inverse(
+            base_quat,
+            (points_world - radar_center_world[:, None, :]).reshape(-1, 3),
+        ).reshape(self.num_envs, num_points, 3)
+        radius = self.radar_radius + self.radar_margin + extra_radius
+        half_height = self.radar_half_height + self.radar_margin + extra_radius
+        radial = torch.linalg.norm(local[..., :2], dim=-1)
+        axial = torch.abs(local[..., 2])
+        radial_gap = radial - radius
+        axial_gap = axial - half_height
+        outside = torch.sqrt(torch.clamp(radial_gap, min=0.) ** 2 + torch.clamp(axial_gap, min=0.) ** 2)
+        inside = -torch.minimum(radius - radial, half_height - axial)
+        return torch.where((radial_gap <= 0) & (axial_gap <= 0), inside, outside)
+
+    def _path_clearance(self, start_world, end_world, samples=32):
+        t = torch.linspace(0., 1., samples, device=self.device)[None, :, None]
+        points = torch.lerp(start_world[:, None, :], end_world[:, None, :], t)
+        return self._radar_clearance_for_points(points, extra_radius=self.arm_collision_radius).min(dim=1).values
+
+    def _plan_ee_path(self, start_world, goal_world):
+        """Return a conservative base-local waypoint when the direct EE path is blocked."""
+        direct_clearance = self._path_clearance(start_world, goal_world)
+        direct_blocked = direct_clearance <= 0.
+        waypoint_local = torch.zeros_like(start_world)
+        waypoint_valid = ~direct_blocked
+        if not torch.any(direct_blocked):
+            return waypoint_valid, waypoint_local, direct_blocked
+
+        center = self.radar_center_local[None, :].expand(self.num_envs, -1)
+        start_local = quat_rotate_inverse(self.base_quat, start_world - self.base_pos)
+        goal_local = quat_rotate_inverse(self.base_quat, goal_world - self.base_pos)
+        midpoint = 0.5 * (start_local + goal_local)
+        side_offset = self.radar_radius + self.radar_margin + self.arm_collision_radius + 0.08
+        vertical_offset = self.radar_half_height + self.radar_margin + self.arm_collision_radius + 0.08
+        candidates = torch.stack((
+            torch.stack((midpoint[:, 0], center[:, 1] - side_offset, midpoint[:, 2]), dim=-1),
+            torch.stack((midpoint[:, 0], center[:, 1] + side_offset, midpoint[:, 2]), dim=-1),
+            torch.stack((midpoint[:, 0], midpoint[:, 1], center[:, 2] + vertical_offset), dim=-1),
+            torch.stack((midpoint[:, 0], midpoint[:, 1], center[:, 2] - vertical_offset), dim=-1),
+        ), dim=1)
+        candidate_world = self.base_pos[:, None, :] + quat_apply(
+            self.base_quat[:, None, :].expand(-1, candidates.shape[1], -1).reshape(-1, 4),
+            (candidates - center[:, None, :]).reshape(-1, 3),
+        ).reshape(self.num_envs, candidates.shape[1], 3) + self.base_pos[:, None, :] * 0
+
+        candidate_clearances = []
+        candidate_lengths = []
+        for idx in range(candidates.shape[1]):
+            candidate = candidate_world[:, idx, :]
+            first = self._path_clearance(start_world, candidate)
+            second = self._path_clearance(candidate, goal_world)
+            candidate_clearances.append(torch.minimum(first, second))
+            candidate_lengths.append(torch.linalg.norm(start_world - candidate, dim=-1) + torch.linalg.norm(candidate - goal_world, dim=-1))
+        candidate_clearances = torch.stack(candidate_clearances, dim=1)
+        candidate_lengths = torch.stack(candidate_lengths, dim=1)
+        valid = candidate_clearances > 0.
+        scores = candidate_lengths + (~valid).float() * 1e3 - candidate_clearances.clamp(min=0.) * 0.1
+        best = torch.argmin(scores, dim=1)
+        selected_clearance = candidate_clearances.gather(1, best[:, None]).squeeze(1)
+        waypoint_valid = (~direct_blocked) | (selected_clearance > 0.)
+        waypoint_local = candidates[torch.arange(self.num_envs, device=self.device), best]
+        waypoint_local = torch.where(waypoint_valid[:, None], waypoint_local, torch.zeros_like(waypoint_local))
+        return waypoint_valid, waypoint_local, direct_blocked
+
+    def _compute_arm_radar_clearance(self):
+        link_points = self.rigid_body_state[:, self.arm_body_indices, :3]
+        points = torch.cat((self.ee_pos[:, None, :], link_points), dim=1)
+        self.radar_clearance = self._radar_clearance_for_points(points, extra_radius=self.arm_collision_radius).min(dim=1).values
+        return self.radar_clearance
+
+    def _reset_goal_planner(self, env_ids):
+        self.goal_blocked[env_ids] = False
+        self.direct_path_blocked[env_ids] = False
+        self.waypoint_active[env_ids] = False
+        self.recovery_timer[env_ids] = 0.
+        self.previous_recovery_error[env_ids] = 0.
+        self.previous_recovery_clearance[env_ids] = 0.
+        self.ee_waypoint_world[env_ids] = self.ee_pos[env_ids]
+    
+            self.base_quat[:, None, :].expand(-1, candidates.shape[1], -1).reshape(-1, 4),
+            (candidates - center[:, None, :]).reshape(-1, 3),
+        ).reshape(self.num_envs, candidates.shape[1], 3) + self.base_pos[:, None, :] * 0
+            candidates.reshape(-1, 3),
+        ).reshape(self.num_envs, candidates.shape[1], 3)
+
+        if not self.cfg.env.teleop_mode:
+            planner_active = self.goal_blocked | self.waypoint_active
+            t = torch.clip(self.goal_timer / self.traj_timesteps, 0, 1)
+            self.curr_ee_goal_sphere[:] = torch.lerp(self.ee_start_sphere, self.ee_goal_sphere, t[:, None])
+            next_sphere = torch.lerp(self.ee_start_sphere, self.ee_goal_sphere, t[:, None])
+            self.curr_ee_goal_sphere[:] = torch.where(planner_active[:, None], self.curr_ee_goal_sphere, next_sphere)
+
+        self.curr_ee_goal_cart_world = self._get_ee_goal_spherical_center() + ee_goal_cart_yaw_global
+        final_ee_goal_cart = sphere2cart(self.ee_goal_sphere)
+        self.final_ee_goal_cart_world = self._get_ee_goal_spherical_center() + quat_apply(self.base_yaw_quat, final_ee_goal_cart)
+        
+
+        # Advance the target only while the current posture can safely progress.
+        if not self.cfg.env.teleop_mode:
+            can_advance = ~(self.goal_blocked | self.waypoint_active)
+            self.goal_timer[can_advance] += 1
+
+        # A short recovery route is attempted before asking the legs to change posture.
+        self._update_collision_state()
+
+        if torch.any(self.waypoint_active):
+            waypoint_world = self.base_pos + quat_apply(self.base_quat, self.ee_waypoint_local)
+            self.ee_waypoint_world[:] = waypoint_world
+            waypoint_error = torch.linalg.norm(self.ee_pos - waypoint_world, dim=-1)
+            reached = self.waypoint_active & (waypoint_error < 0.06)
+            self.waypoint_active[reached] = False
+            self.goal_blocked[reached] = False
+            self.curr_ee_goal_cart_world[self.waypoint_active] = waypoint_world[self.waypoint_active]
+            self.recovery_timer[self.waypoint_active] += self.dt
+
+        blocked_without_route = self.goal_blocked & ~self.waypoint_active
+        self.recovery_timer[blocked_without_route] += self.dt
+        timeout = blocked_without_route & (self.recovery_timer > 2.0)
+        if torch.any(timeout):
+            self._resample_ee_goal(timeout.nonzero(as_tuple=False).flatten())
+            self._reset_goal_planner(timeout.nonzero(as_tuple=False).flatten())
+            self.curr_ee_goal_sphere[timeout] = self.ee_start_sphere[timeout]
+            self.curr_ee_goal_cart[timeout] = sphere2cart(self.curr_ee_goal_sphere[timeout])
+            self.curr_ee_goal_cart_world[timeout] = self._get_ee_goal_spherical_center()[timeout] + quat_apply(self.base_yaw_quat[timeout], self.curr_ee_goal_cart[timeout])
+            self.final_ee_goal_cart_world[timeout] = self._get_ee_goal_spherical_center()[timeout] + quat_apply(self.base_yaw_quat[timeout], sphere2cart(self.ee_goal_sphere[timeout]))
+
+        # TODO: for the teleop mode, we need to directly update self.ee_goal_orn_quat using VR controller.
+        
+        self.goal_timer += 1
+        resample_id = (self.goal_timer > self.traj_total_timesteps).nonzero(as_tuple=False).flatten()
+        resample_id = ((self.goal_timer > self.traj_total_timesteps) & ~(self.goal_blocked | self.waypoint_active)).nonzero(as_tuple=False).flatten()
+        
+        self.ee_waypoint_world[env_ids] = self.ee_pos[env_ids]
+
+    def _update_collision_state(self):
+        self._compute_arm_radar_clearance()
+        self.ik_position_residual = torch.linalg.norm(self.final_ee_goal_cart_world - self.ee_pos, dim=-1)
+        path_clearance = self._path_clearance(self.ee_pos, self.final_ee_goal_cart_world)
+        self.direct_path_blocked = path_clearance <= 0.
+
+        # Keep an existing route stable while the arm follows its waypoint.
+        if torch.any(self.waypoint_active):
+            waypoint_world = self.base_pos + quat_apply(self.base_quat, self.ee_waypoint_local)
+            waypoint_clearance = self._radar_clearance_for_points(
+                waypoint_world[:, None, :], extra_radius=self.arm_collision_radius
+            ).squeeze(1)
+            invalid_route = self.waypoint_active & (waypoint_clearance <= 0.)
+            self.waypoint_active[invalid_route] = False
+            self.goal_blocked[invalid_route] = True
+            return
+
+        direct_blocked = self.direct_path_blocked
+        if torch.any(direct_blocked):
+            route_valid, waypoint_local, _ = self._plan_ee_path(self.ee_pos, self.final_ee_goal_cart_world)
+            new_route = direct_blocked & route_valid
+            self.ee_waypoint_local[new_route] = waypoint_local[new_route]
+            self.waypoint_active[new_route] = True
+            self.goal_blocked[new_route] = False
+            no_route = direct_blocked & ~route_valid
+            self.goal_blocked[no_route] = True
+            self.recovery_timer[no_route] = 0.
+        else:
+            self.goal_blocked[:] = False
+            self.recovery_timer[~direct_blocked] = 0.
+    
+        self.ee_waypoint_world = self.ee_pos.clone()
+        self.ee_waypoint_local = torch.zeros_like(self.ee_pos)
+        self.final_ee_goal_cart_world = self.curr_ee_goal_cart_world.clone()
+        self.ee_waypoint_world[env_ids] = self.ee_pos[env_ids]
+        self.ee_waypoint_local[env_ids] = 0.
+
+        self.goal_timer[env_ids] = 0.
+        self._reset_goal_planner(env_ids)
+
+                self.ee_start_sphere[env_ids] = self.ee_goal_sphere[env_ids].clone()
+                for i in range(10):
+                for i in range(64):
+                    self._resample_ee_goal_sphere_once(env_ids)
+                    collision_mask = self._collision_check(env_ids)
+                    final_goal_cart = sphere2cart(self.ee_goal_sphere[env_ids])
+                    final_goal_world = self._get_ee_goal_spherical_center()[env_ids] + quat_apply(self.base_yaw_quat[env_ids], final_goal_cart)
+                    target_inside_radar = self._radar_clearance_for_points(
+                        final_goal_world[:, None, :], extra_radius=self.arm_collision_radius
+                    ).squeeze(1) <= 0.
+                    env_ids = env_ids[collision_mask]
+                    env_ids = env_ids[collision_mask | target_inside_radar]
+                    if len(env_ids) == 0:
+        self.compute_reward()
+        self.previous_recovery_error[:] = self.ik_position_residual
+        self.previous_recovery_clearance[:] = self.radar_clearance
+        env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
+                                    ),dim=-1)
+        if getattr(self.cfg.env, "observe_radar_state", False):
+            radar_center_world = self.base_pos + quat_apply(self.base_quat, self.radar_center_local[None, :])
+            goal_relative_radar = quat_rotate_inverse(self.base_quat, self.final_ee_goal_cart_world - radar_center_world)
+            ee_relative_radar = quat_rotate_inverse(self.base_quat, self.ee_pos - radar_center_world)
+            collision_obs = torch.cat((
+                goal_relative_radar,
+                ee_relative_radar,
+                torch.clamp(self.radar_clearance / 0.2, -1., 1.).unsqueeze(1),
+                self.direct_path_blocked.float().unsqueeze(1),
+                torch.clamp(self.ik_position_residual / 1.0, 0., 1.).unsqueeze(1),
+                (self.goal_blocked | self.waypoint_active).float().unsqueeze(1),
+            ), dim=-1)
+            obs_buf = torch.cat((obs_buf, collision_obs), dim=-1)
+        if self.cfg.env.observe_gait_commands:
+
+        if getattr(self.cfg.env, "observe_radar_state", False):
+            noise_vec[idx:idx+10] = 0
+            idx += 10
+
+        if self.cfg.terrain.measure_heights:
+                    final_goal_world = self._get_ee_goal_spherical_center()[env_ids] + quat_apply(self.base_yaw_quat[env_ids], final_goal_cart)
+                    if getattr(self.cfg.env, "enable_radar_recovery", False):
+                    target_inside_radar = self._radar_clearance_for_points(
+                        final_goal_world[:, None, :], extra_radius=self.arm_collision_radius
+                    ).squeeze(1) <= 0.
+                        target_inside_radar = self._radar_clearance_for_points(
+                            final_goal_world[:, None, :], extra_radius=self.arm_collision_radius
+                        ).squeeze(1) <= 0.
+                    else:
+                        target_inside_radar = torch.zeros_like(collision_mask)
+                    env_ids = env_ids[collision_mask | target_inside_radar]
+        # A short recovery route is attempted before asking the legs to change posture.
+        if getattr(self.cfg.env, "enable_radar_recovery", False):
+        self._update_collision_state()
+            self._update_collision_state()
+
+import os
+import math
+import xml.etree.ElementTree as ET
+
+        arm_body_names = ["link00", "link01", "link02", "link03", "link04", "link05", "link06", "gripperStator", "gripperMover"]
+        self.arm_body_names = [name for name in arm_body_names if name in self.body_names]
+        self.arm_body_indices = torch.tensor(
+            [self.body_names_to_idx[name] for name in arm_body_names if name in self.body_names],
+            [self.body_names_to_idx[name] for name in self.arm_body_names],
+            dtype=torch.long,
+        self.waypoint_active = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.waypoint_reached = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.ee_waypoint_world = self.ee_pos.clone()
+        self.previous_recovery_clearance = torch.zeros(self.num_envs, device=self.device)
+        self.recovery_blocked_steps = torch.zeros(self.num_envs, device=self.device)
+        self.recovery_timeout_events = torch.zeros(self.num_envs, device=self.device)
+        self.min_radar_clearance_episode = torch.full(
+            (self.num_envs,), float("inf"), device=self.device
+        )
+        self.arm_collision_radii = self._load_arm_collision_radii()
+
+        self.waypoint_active[env_ids] = False
+        self.waypoint_reached[env_ids] = False
+        self.recovery_timer[env_ids] = 0.
+
+    def _load_arm_collision_radii(self):
+        """Load conservative per-link bounding radii from the configured URDF."""
+        fallback = self.arm_collision_radius
+        radii = [fallback] * (len(self.arm_body_names) + 1)  # EE point, then rigid-body points
+        urdf_path = getattr(self.cfg.asset, "file", "")
+        urdf_path = urdf_path.replace("{LEGGED_GYM_ROOT_DIR}", LEGGED_GYM_ROOT_DIR)
+        if not os.path.isfile(urdf_path):
+            return torch.tensor(radii, dtype=torch.float, device=self.device)
+
+        try:
+            root = ET.parse(urdf_path).getroot()
+            for point_idx, link_name in enumerate(self.arm_body_names, start=1):
+                link = root.find(".//link[@name='%s']" % link_name)
+                if link is None:
+                    continue
+                link_radius = fallback
+                for collision in link.findall("collision"):
+                    geometry = collision.find("geometry")
+                    if geometry is None:
+                        continue
+                    sphere = geometry.find("sphere")
+                    cylinder = geometry.find("cylinder")
+                    box = geometry.find("box")
+                    if sphere is not None:
+                        link_radius = max(link_radius, float(sphere.attrib.get("radius", fallback)))
+                    elif cylinder is not None:
+                        radius = float(cylinder.attrib.get("radius", fallback))
+                        length = float(cylinder.attrib.get("length", 0.0))
+                        link_radius = max(link_radius, math.sqrt(radius * radius + (0.5 * length) ** 2))
+                    elif box is not None:
+                        size = [float(value) for value in box.attrib.get("size", "").split()]
+                        if len(size) == 3:
+                            link_radius = max(link_radius, 0.5 * math.sqrt(sum(value * value for value in size)))
+                    # Mesh bounds are not available from URDF alone; retain the configured fallback.
+                radii[point_idx] = link_radius
+            # The grasp point is offset from gripperMover, so use that link's radius for the EE point.
+            if self.arm_body_names:
+                radii[0] = radii[-1]
+        except (ET.ParseError, OSError, ValueError):
+            # A missing or malformed URDF must not prevent non-collision tasks from starting.
+            pass
+        return torch.tensor(radii, dtype=torch.float, device=self.device)
+
+    def _update_collision_state(self):
+        self._update_curr_ee_goal()
+        if getattr(self.cfg.env, "enable_radar_recovery", False):
+            self.recovery_blocked_steps += self.goal_blocked.float()
+            self.min_radar_clearance_episode = torch.minimum(
+                self.min_radar_clearance_episode, self.radar_clearance
+            )
+
+
+        if getattr(self.cfg.env, "enable_radar_recovery", False):
+            episode_length = torch.clamp(self.episode_length_buf[env_ids].float(), min=1.)
+            self.extras["episode"]["metric_goal_blocked_rate"] = torch.mean(
+                self.recovery_blocked_steps[env_ids] / episode_length
+            )
+            self.extras["episode"]["metric_recovery_timeout_events"] = torch.mean(
+                self.recovery_timeout_events[env_ids]
+            )
+            self.extras["episode"]["metric_min_radar_clearance"] = torch.mean(
+                self.min_radar_clearance_episode[env_ids]
+            )
+            self.recovery_blocked_steps[env_ids] = 0.
+            self.recovery_timeout_events[env_ids] = 0.
+            self.min_radar_clearance_episode[env_ids] = float("inf")
+
+        if not start:
+        ).reshape(self.num_envs, num_points, 3)
+        if torch.is_tensor(extra_radius):
+            extra_radius = extra_radius.to(device=self.device, dtype=points_world.dtype)
+            if extra_radius.dim() == 1:
+                extra_radius = extra_radius.unsqueeze(0)
+            if extra_radius.shape[0] == 1:
+                extra_radius = extra_radius.expand(self.num_envs, -1)
+            extra_radius = extra_radius[:, :num_points]
+        radius = self.radar_radius + self.radar_margin + extra_radius
+        points = torch.cat((self.ee_pos[:, None, :], link_points), dim=1)
+        self.radar_clearance = self._radar_clearance_for_points(points, extra_radius=self.arm_collision_radius).min(dim=1).values
+        self.radar_clearance = self._radar_clearance_for_points(
+            points, extra_radius=self.arm_collision_radii[None, :]
+        ).min(dim=1).values
+        return self.radar_clearance
+        self.ik_position_residual = torch.linalg.norm(self.final_ee_goal_cart_world - self.ee_pos, dim=-1)
+        route_complete = self.waypoint_reached.clone()
+        final_reached = route_complete & (self.ik_position_residual < 0.08)
+        self.waypoint_reached[final_reached] = False
+        route_complete &= ~final_reached
+        path_clearance = self._path_clearance(self.ee_pos, self.final_ee_goal_cart_world)
+        self.direct_path_blocked = path_clearance <= 0.
+        self.direct_path_blocked = torch.where(
+            route_complete, torch.zeros_like(path_clearance), path_clearance <= 0.
+        )
+
+        # The planner already checked the waypoint-to-goal segment. Keep this
+        # route in its final phase instead of re-planning from the waypoint.
+        if torch.any(route_complete):
+            self.goal_blocked[route_complete] = False
+            self.recovery_timer[route_complete] = 0.
+
+            self.goal_blocked[reached] = False
+            self.waypoint_reached[reached] = True
+            self.recovery_timer[reached] = 0.
+            self.curr_ee_goal_cart_world[self.waypoint_active] = waypoint_world[self.waypoint_active]
+            self.curr_ee_goal_cart_world[reached] = self.final_ee_goal_cart_world[reached]
+            self.recovery_timer[self.waypoint_active] += self.dt
+
+        route_complete = self.waypoint_reached & ~self.waypoint_active
+        self.curr_ee_goal_cart_world[route_complete] = self.final_ee_goal_cart_world[route_complete]
+
+        blocked_without_route = self.goal_blocked & ~self.waypoint_active
+        if torch.any(timeout):
+            self.recovery_timeout_events[timeout] += 1.
+            self._resample_ee_goal(timeout.nonzero(as_tuple=False).flatten())
+            self.goal_timer[init_env_ids] = 0.0
+            if not is_init and hasattr(self, "waypoint_reached"):
+                self._reset_goal_planner(init_env_ids)
+
+
+    def _radar_clearance_for_points(self, points_world, extra_radius=0.0):
+    def _radar_clearance_for_points(self, points_world, extra_radius=0.0, env_ids=None):
+        """Signed clearance of world points from the B2 base-mounted radar cylinder."""
+        batch_size = points_world.shape[0]
+        num_points = points_world.shape[1]
+        if env_ids is None:
+            if batch_size != self.num_envs:
+                raise ValueError("env_ids is required for a radar point batch smaller than num_envs")
+            base_quat_source = self.base_quat
+            base_pos_source = self.base_pos
+        else:
+            base_quat_source = self.base_quat[env_ids]
+            base_pos_source = self.base_pos[env_ids]
+        base_quat = self.base_quat[:, None, :].expand(-1, num_points, -1).reshape(-1, 4)
+        radar_center_world = self.base_pos + quat_apply(self.base_quat, self.radar_center_local[None, :])
+        base_quat = base_quat_source[:, None, :].expand(-1, num_points, -1).reshape(-1, 4)
+        radar_center_world = base_pos_source + quat_apply(base_quat_source, self.radar_center_local[None, :])
+        local = quat_rotate_inverse(
+            (points_world - radar_center_world[:, None, :]).reshape(-1, 3),
+        ).reshape(self.num_envs, num_points, 3)
+        ).reshape(batch_size, num_points, 3)
+        if torch.is_tensor(extra_radius):
+            if extra_radius.shape[0] == 1:
+                extra_radius = extra_radius.expand(self.num_envs, -1)
+                extra_radius = extra_radius.expand(batch_size, -1)
+            extra_radius = extra_radius[:, :num_points]
+                        target_inside_radar = self._radar_clearance_for_points(
+                            final_goal_world[:, None, :], extra_radius=self.arm_collision_radius
+                            final_goal_world[:, None, :],
+                            extra_radius=self.arm_collision_radius,
+                            env_ids=env_ids,
+                        ).squeeze(1) <= 0.
+            )
+            self.extras["episode"]["metric_recovery_timeout_events"] = torch.mean(
+                self.recovery_timeout_events[env_ids]
+            self.extras["episode"]["metric_recovery_timeout_rate"] = torch.mean(
+                self.recovery_timeout_events[env_ids] / episode_length
+            )
+            return
+        episode_lengths = torch.clamp(self.episode_length_buf[env_ids].float(), min=1.)
+        # update curriculum
+        if getattr(self.cfg.env, "enable_radar_recovery", False):
+            episode_length = torch.clamp(self.episode_length_buf[env_ids].float(), min=1.)
+            self.extras["episode"]["metric_goal_blocked_rate"] = torch.mean(
+                self.recovery_blocked_steps[env_ids] / episode_length
+                self.recovery_blocked_steps[env_ids] / episode_lengths
+            )
+            self.extras["episode"]["metric_recovery_timeout_rate"] = torch.mean(
+                self.recovery_timeout_events[env_ids] / episode_length
+                self.recovery_timeout_events[env_ids] / episode_lengths
+            )
+        if getattr(self.cfg.env, "observe_radar_state", False):
+            radar_center_world = self.base_pos + quat_apply(self.base_quat, self.radar_center_local[None, :])
+            radar_center_world = self.base_pos + quat_apply(
+                self.base_quat, self.radar_center_local[None, :].expand(self.num_envs, -1)
+            )
+            goal_relative_radar = quat_rotate_inverse(self.base_quat, self.final_ee_goal_cart_world - radar_center_world)
+        base_quat = base_quat_source[:, None, :].expand(-1, num_points, -1).reshape(-1, 4)
+        radar_center_world = base_pos_source + quat_apply(base_quat_source, self.radar_center_local[None, :])
+        radar_center_world = base_pos_source + quat_apply(
+            base_quat_source, self.radar_center_local[None, :].expand(batch_size, -1)
+        )
+        local = quat_rotate_inverse(
+        midpoint = 0.5 * (start_local + goal_local)
+        side_offset = self.radar_radius + self.radar_margin + self.arm_collision_radius + 0.08
+        vertical_offset = self.radar_half_height + self.radar_margin + self.arm_collision_radius + 0.08
+        side_offset = self.radar_radius + self.radar_margin + self.arm_collision_radius + 0.12
+        vertical_offset = self.radar_half_height + self.radar_margin + self.arm_collision_radius + 0.12
+        candidates = torch.stack((
+                            link_radius = max(link_radius, 0.5 * math.sqrt(sum(value * value for value in size)))
+                    # Mesh bounds are not available from URDF alone; retain the configured fallback.
+                    elif geometry.find("mesh") is not None:
+                        # Mesh extents are unavailable without loading the mesh;
+                        # use a small conservative gripper/link bound.
+                        link_radius = max(link_radius, 0.06)
+                radii[point_idx] = link_radius
+        self.waypoint_reached = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.waypoint_stage = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.ee_waypoint_world = self.ee_pos.clone()
+        self.ee_waypoint_local = torch.zeros_like(self.ee_pos)
+        self.ee_waypoint2_local = torch.zeros_like(self.ee_pos)
+        self.final_ee_goal_cart_world = self.curr_ee_goal_cart_world.clone()
+        self.waypoint_reached[env_ids] = False
+        self.waypoint_stage[env_ids] = 0
+        self.recovery_timer[env_ids] = 0.
+        self.ee_waypoint_local[env_ids] = 0.
+        self.ee_waypoint2_local[env_ids] = 0.
+
+    def _plan_ee_path(self, start_world, goal_world):
+        """Return a conservative base-local waypoint when the direct EE path is blocked."""
+        """Plan a two-waypoint detour around the base-mounted radar."""
+        direct_clearance = self._path_clearance(start_world, goal_world)
+        waypoint_local = torch.zeros_like(start_world)
+        waypoint2_local = torch.zeros_like(start_world)
+        waypoint_valid = ~direct_blocked
+        if not torch.any(direct_blocked):
+            return waypoint_valid, waypoint_local, direct_blocked
+            return waypoint_valid, waypoint_local, waypoint2_local, direct_blocked
+
+        midpoint = 0.5 * (start_local + goal_local)
+        side_offset = self.radar_radius + self.radar_margin + self.arm_collision_radius + 0.12
+        radial_offset = self.radar_radius + self.radar_margin + self.arm_collision_radius + 0.12
+        vertical_offset = self.radar_half_height + self.radar_margin + self.arm_collision_radius + 0.12
+        # Forward/backward routes cross the radar at a safe x coordinate;
+        # above/below routes cross it at a safe z coordinate. Each route has
+        # two waypoints so a left-to-right transition does not cut through the
+        # obstacle between a single pair of points.
+        candidates = torch.stack((
+            torch.stack((midpoint[:, 0], center[:, 1] - side_offset, midpoint[:, 2]), dim=-1),
+            torch.stack((midpoint[:, 0], center[:, 1] + side_offset, midpoint[:, 2]), dim=-1),
+            torch.stack((midpoint[:, 0], midpoint[:, 1], center[:, 2] + vertical_offset), dim=-1),
+            torch.stack((midpoint[:, 0], midpoint[:, 1], center[:, 2] - vertical_offset), dim=-1),
+        candidates1 = torch.stack((
+            torch.stack((center[:, 0] + radial_offset, start_local[:, 1], midpoint[:, 2]), dim=-1),
+            torch.stack((center[:, 0] - radial_offset, start_local[:, 1], midpoint[:, 2]), dim=-1),
+            torch.stack((start_local[:, 0], start_local[:, 1], center[:, 2] + vertical_offset), dim=-1),
+            torch.stack((start_local[:, 0], start_local[:, 1], center[:, 2] - vertical_offset), dim=-1),
+        ), dim=1)
+        candidate_world = self.base_pos[:, None, :] + quat_apply(
+            self.base_quat[:, None, :].expand(-1, candidates.shape[1], -1).reshape(-1, 4),
+            candidates.reshape(-1, 3),
+        ).reshape(self.num_envs, candidates.shape[1], 3)
+        candidates2 = torch.stack((
+            torch.stack((center[:, 0] + radial_offset, goal_local[:, 1], midpoint[:, 2]), dim=-1),
+            torch.stack((center[:, 0] - radial_offset, goal_local[:, 1], midpoint[:, 2]), dim=-1),
+            torch.stack((goal_local[:, 0], goal_local[:, 1], center[:, 2] + vertical_offset), dim=-1),
+            torch.stack((goal_local[:, 0], goal_local[:, 1], center[:, 2] - vertical_offset), dim=-1),
+        ), dim=1)
+        route_quat = self.base_quat[:, None, :].expand(-1, candidates1.shape[1], -1).reshape(-1, 4)
+        candidate1_world = self.base_pos[:, None, :] + quat_apply(
+            route_quat, candidates1.reshape(-1, 3)
+        ).reshape(self.num_envs, candidates1.shape[1], 3)
+        candidate2_world = self.base_pos[:, None, :] + quat_apply(
+            route_quat, candidates2.reshape(-1, 3)
+        ).reshape(self.num_envs, candidates2.shape[1], 3)
+
+        candidate_lengths = []
+        for idx in range(candidates.shape[1]):
+            candidate = candidate_world[:, idx, :]
+            first = self._path_clearance(start_world, candidate)
+            second = self._path_clearance(candidate, goal_world)
+            candidate_clearances.append(torch.minimum(first, second))
+            candidate_lengths.append(torch.linalg.norm(start_world - candidate, dim=-1) + torch.linalg.norm(candidate - goal_world, dim=-1))
+        for idx in range(candidates1.shape[1]):
+            candidate1 = candidate1_world[:, idx, :]
+            candidate2 = candidate2_world[:, idx, :]
+            first = self._path_clearance(start_world, candidate1)
+            second = self._path_clearance(candidate1, candidate2)
+            third = self._path_clearance(candidate2, goal_world)
+            candidate_clearances.append(torch.minimum(torch.minimum(first, second), third))
+            candidate_lengths.append(
+                torch.linalg.norm(start_world - candidate1, dim=-1)
+                + torch.linalg.norm(candidate1 - candidate2, dim=-1)
+                + torch.linalg.norm(candidate2 - goal_world, dim=-1)
+            )
+        candidate_clearances = torch.stack(candidate_clearances, dim=1)
+        waypoint_valid = (~direct_blocked) | (selected_clearance > 0.)
+        waypoint_local = candidates[torch.arange(self.num_envs, device=self.device), best]
+        waypoint_local = candidates1[torch.arange(self.num_envs, device=self.device), best]
+        waypoint2_local = candidates2[torch.arange(self.num_envs, device=self.device), best]
+        waypoint_local = torch.where(waypoint_valid[:, None], waypoint_local, torch.zeros_like(waypoint_local))
+        waypoint2_local = torch.where(waypoint_valid[:, None], waypoint2_local, torch.zeros_like(waypoint2_local))
+        return waypoint_valid, waypoint_local, direct_blocked
+        return waypoint_valid, waypoint_local, waypoint2_local, direct_blocked
+
+        if torch.any(direct_blocked):
+            route_valid, waypoint_local, _ = self._plan_ee_path(self.ee_pos, self.final_ee_goal_cart_world)
+            route_valid, waypoint_local, waypoint2_local, _ = self._plan_ee_path(
+                self.ee_pos, self.final_ee_goal_cart_world
+            )
+            new_route = direct_blocked & route_valid
+            self.ee_waypoint_local[new_route] = waypoint_local[new_route]
+            self.ee_waypoint2_local[new_route] = waypoint2_local[new_route]
+            self.waypoint_stage[new_route] = 1
+            self.waypoint_active[new_route] = True
+        if torch.any(self.waypoint_active):
+            active_second = self.waypoint_stage == 2
+            active_waypoint_local = torch.where(
+                active_second[:, None], self.ee_waypoint2_local, self.ee_waypoint_local
+            )
+            waypoint_world = self.base_pos + quat_apply(self.base_quat, self.ee_waypoint_local)
+            waypoint_world = self.base_pos + quat_apply(self.base_quat, active_waypoint_local)
+            waypoint_clearance = self._radar_clearance_for_points(
+        if torch.any(self.waypoint_active):
+            active_second = self.waypoint_stage == 2
+            active_waypoint_local = torch.where(
+                active_second[:, None], self.ee_waypoint2_local, self.ee_waypoint_local
+            )
+            waypoint_world = self.base_pos + quat_apply(self.base_quat, self.ee_waypoint_local)
+            waypoint_world = self.base_pos + quat_apply(self.base_quat, active_waypoint_local)
+            self.ee_waypoint_world[:] = waypoint_world
+            reached = self.waypoint_active & (waypoint_error < 0.06)
+            first_reached = reached & (self.waypoint_stage == 1)
+            second_reached = reached & (self.waypoint_stage == 2)
+            self.waypoint_stage[first_reached] = 2
+            self.waypoint_active[reached] = False
+            self.waypoint_active[second_reached] = False
+            self.goal_blocked[reached] = False
+            self.waypoint_reached[reached] = True
+            self.waypoint_reached[second_reached] = True
+            self.recovery_timer[reached] = 0.
+            self.curr_ee_goal_cart_world[self.waypoint_active] = waypoint_world[self.waypoint_active]
+            self.curr_ee_goal_cart_world[reached] = self.final_ee_goal_cart_world[reached]
+            self.curr_ee_goal_cart_world[second_reached] = self.final_ee_goal_cart_world[second_reached]
+            self.recovery_timer[self.waypoint_active] += self.dt
+    def __init__(self, cfg, *args, **kwargs):
+        if getattr(cfg.env, "observe_radar_state", False):
+        proprio_extra = False
+        if getattr(cfg.env, "observe_radar_state", False) and not getattr(cfg.env, "_radar_obs_applied", False):
+            cfg.env.num_proprio += 10
+            cfg.env._radar_obs_applied = True
+            proprio_extra = True
+        if cfg.env.observe_gait_commands:
+            cfg.env.num_proprio += 5 # gait_indices=1, clock_phase=4
+            proprio_extra = True
+        if proprio_extra:
+            cfg.env.num_observations = cfg.env.num_proprio * (cfg.env.history_len+1) + cfg.env.num_priv
+        self.arm_collision_radii = self._load_arm_collision_radii()
+        self.ee_collision_radius = self.arm_collision_radii[0]
+
+        points = torch.lerp(start_world[:, None, :], end_world[:, None, :], t)
+        return self._radar_clearance_for_points(points, extra_radius=self.arm_collision_radius).min(dim=1).values
+        return self._radar_clearance_for_points(points, extra_radius=self.ee_collision_radius).min(dim=1).values
+
+            waypoint_clearance = self._radar_clearance_for_points(
+                waypoint_world[:, None, :], extra_radius=self.arm_collision_radius
+                waypoint_world[:, None, :], extra_radius=self.ee_collision_radius
+            ).squeeze(1)
+                            final_goal_world[:, None, :],
+                            extra_radius=self.arm_collision_radius,
+                            extra_radius=self.ee_collision_radius,
+                            env_ids=env_ids,
+        midpoint = 0.5 * (start_local + goal_local)
+        radial_offset = self.radar_radius + self.radar_margin + self.arm_collision_radius + 0.12
+        vertical_offset = self.radar_half_height + self.radar_margin + self.arm_collision_radius + 0.12
+        radial_offset = self.radar_radius + self.radar_margin + self.ee_collision_radius + 0.12
+        vertical_offset = self.radar_half_height + self.radar_margin + self.ee_collision_radius + 0.12
+        # Forward/backward routes cross the radar at a safe x coordinate;
+            proprio_extra = True
+        if cfg.env.observe_gait_commands:
+        if cfg.env.observe_gait_commands and not getattr(cfg.env, "_gait_obs_applied", False):
+            print("||||||||||Observe gait commands!")
+            cfg.env.num_proprio += 5 # gait_indices=1, clock_phase=4
+            cfg.env._gait_obs_applied = True
+            proprio_extra = True
+                        continue
+                    origin = collision.find("origin")
+                    if origin is None:
+                        origin_norm = 0.0
+                    else:
+                        origin_xyz = [float(value) for value in origin.attrib.get("xyz", "0 0 0").split()]
+                        origin_norm = math.sqrt(sum(value * value for value in origin_xyz))
+                    primitive_radius = fallback
+                    sphere = geometry.find("sphere")
+                    if sphere is not None:
+                        link_radius = max(link_radius, float(sphere.attrib.get("radius", fallback)))
+                        primitive_radius = float(sphere.attrib.get("radius", fallback))
+                    elif cylinder is not None:
+                        length = float(cylinder.attrib.get("length", 0.0))
+                        link_radius = max(link_radius, math.sqrt(radius * radius + (0.5 * length) ** 2))
+                        primitive_radius = math.sqrt(radius * radius + (0.5 * length) ** 2)
+                    elif box is not None:
+                        if len(size) == 3:
+                            link_radius = max(link_radius, 0.5 * math.sqrt(sum(value * value for value in size)))
+                            primitive_radius = 0.5 * math.sqrt(sum(value * value for value in size))
+                    elif geometry.find("mesh") is not None:
+                        # use a small conservative gripper/link bound.
+                        primitive_radius = 0.06
+                        link_radius = max(link_radius, 0.06)
+                    link_radius = max(link_radius, origin_norm + primitive_radius)
+                radii[point_idx] = link_radius
+        # Keep an existing route stable while the arm follows its waypoint.
+        if torch.any(self.waypoint_active):
+        active_route = self.waypoint_active.clone()
+        if torch.any(active_route):
+            active_second = self.waypoint_stage == 2
+            self.goal_blocked[invalid_route] = True
+            return
+            active_route = self.waypoint_active.clone()
+
+        # Only environments without an active route or completed route may
+        # start a new plan. Other environments must keep their current route
+        # state independent of the rest of the batch.
+        planning_mask = ~(active_route | route_complete)
+        direct_blocked = self.direct_path_blocked
+        direct_blocked = self.direct_path_blocked & planning_mask
+        clear_path = planning_mask & ~self.direct_path_blocked
+        self.direct_path_blocked[active_route | route_complete] = False
+        self.goal_blocked[clear_path] = False
+        self.recovery_timer[clear_path] = 0.
+        if torch.any(direct_blocked):
+            self.recovery_timer[no_route] = 0.
+        else:
+            self.goal_blocked[:] = False
+            self.recovery_timer[~direct_blocked] = 0.
+    
+            extra_radius = extra_radius.to(device=self.device, dtype=points_world.dtype)
+            if extra_radius.dim() == 1:
+                extra_radius = extra_radius.unsqueeze(0)
+            if extra_radius.shape[0] == 1:
+                extra_radius = extra_radius.expand(batch_size, -1)
+            extra_radius = extra_radius[:, :num_points]
+            if extra_radius.dim() == 0:
+                extra_radius = extra_radius.expand(batch_size, num_points)
+            elif extra_radius.dim() == 1:
+                if extra_radius.numel() == 1:
+                    extra_radius = extra_radius.expand(batch_size, num_points)
+                elif extra_radius.shape[0] == num_points:
+                    extra_radius = extra_radius[None, :].expand(batch_size, -1)
+                elif extra_radius.shape[0] == batch_size:
+                    extra_radius = extra_radius[:, None].expand(-1, num_points)
+                else:
+                    raise ValueError("1-D extra_radius must match points or batch dimensions")
+            elif extra_radius.dim() == 2:
+                if extra_radius.shape[0] == 1:
+                    extra_radius = extra_radius.expand(batch_size, -1)
+                elif extra_radius.shape[0] != batch_size:
+                    raise ValueError("2-D extra_radius batch dimension mismatch")
+                if extra_radius.shape[1] == 1:
+                    extra_radius = extra_radius.expand(-1, num_points)
+                elif extra_radius.shape[1] != num_points:
+                    raise ValueError("2-D extra_radius point dimension mismatch")
+            else:
+                raise ValueError("extra_radius must be a scalar, vector, or matrix")
+        radius = self.radar_radius + self.radar_margin + extra_radius
+        self.direct_path_blocked = torch.where(
+            route_complete, torch.zeros_like(path_clearance), path_clearance <= 0.
+            route_complete, torch.zeros_like(self.direct_path_blocked), path_clearance <= 0.
+        )
+low-level/legged_gym/envs/rewards/maniploco_rewards.py
+
+    def _reward_tracking_ee_final_blocked(self):
+        """Keep pressure on the final goal while the safe EE reference is paused."""
+        ee_pos_error = torch.sum(torch.abs(self.env.ee_pos - self.env.final_ee_goal_cart_world), dim=1)
+        reward = torch.exp(-ee_pos_error / self.env.cfg.rewards.tracking_ee_sigma * 2)
+        active = (self.env.goal_blocked | self.env.waypoint_active).float()
+        return reward * active, ee_pos_error * active
+
+    def _reward_radar_clearance_violation(self):
+        margin = self.env.radar_margin
+        violation = torch.clamp(margin - self.env.radar_clearance, min=0.) / max(margin, 1e-6)
+        return violation, violation
+
+    def _reward_recovery_progress(self):
+        active = (self.env.goal_blocked | self.env.waypoint_active).float()
+        error_progress = self.env.previous_recovery_error - self.env.ik_position_residual
+        clearance_progress = self.env.radar_clearance - self.env.previous_recovery_clearance
+        progress = torch.clamp(error_progress + clearance_progress, -1., 1.)
+        return progress * active, progress * active
+
+    def _reward_tracking_ee_sphere_walking(self):
+low-level/legged_gym/envs/manip_loco/b2z1_config.py
+
+        # Base-mounted B2 radar collision primitive used by the whole-body recovery state.
+        radar_center_local = [0.34218, 0.0, 0.15851]
+        radar_radius = 0.076
+        radar_half_height = 0.08
+        radar_margin = 0.03
+        arm_collision_radius = 0.045
+
+    class env(B2Z1ReachableWorkspaceCfg.env):
+        observe_radar_state = True
+        num_proprio = B2Z1ReachableWorkspaceCfg.env.num_proprio + 10
+
+    class arm(B2Z1ReachableWorkspaceCfg.arm):
+            tracking_ee_world = 0.8
+            tracking_ee_final_blocked = 0.8
+            radar_clearance_violation = -1.0
+            recovery_progress = 0.5
+
+    class algorithm(B2Z1ReachableWorkspaceCfgPPO.algorithm):
+        mixing_schedule = [0.5, 2000, 2000]
+        mixing_schedule = [1.0, 0, 3000]
+
+    class runner(B2Z1ReachableWorkspaceCfgPPO.runner):
+        experiment_name = 'b2_z1_reachable_balanced'
+        experiment_name = 'b2_z1_reachable_collision_wholebody_6144_20260821'
+        save_interval = 500
+        observe_radar_state = True
+        num_proprio = B2Z1ReachableWorkspaceCfg.env.num_proprio + 10
+        enable_radar_recovery = True
+
+1. 当前不是“只有 2 个 waypoint 采样点”。
+
+代码中实际是：
+
+- `waypoint_1`
+- `waypoint_2`
+- 最终目标
+
+也就是两段中间绕行点。每一段路径又通过 `_path_clearance(..., samples=32)` 采样了 32 个碰撞检查点。
+
+视频中的 10 个红色点只是起点到最终目标的球坐标插值，不是 10 个 waypoint，见 [`play_aliengo_z1_video.py:109`](/root/rivermind-data/visual_wholebody/low-level/legged_gym/scripts/play_aliengo_z1_video.py:109)。
+
+对于“从左侧绕到右侧”的简单圆柱障碍，两级 waypoint 理论上已经足够：
+
+```text
+当前状态 -> 绕行点 1 -> 绕行点 2 -> 目标
+```
+
+增加到 10 个 waypoint 不会自动解决当前问题，因为当前主要失败原因是：
+
+- 机械臂已经进入雷达安全体；
+- planner 从一个已经碰撞的起点开始规划；
+- 规划只检查 EE 中心点，没有检查整条 arm link 的扫掠区域。
+
+这种情况下，即使增加到 10 个点，仍可能是：
+
+```text
+碰撞状态 -> 10 个碰撞或不可达的点
+```
+
+所以当前更应该增加“逃逸 waypoint”机制，并对 arm link 做 swept-collision 检查。若只是希望路径更平滑，可以把一条安全曲线离散成 10 个采样点，但不应把它们当成 10 个独立决策 waypoint。
+
+2. 没有通过调整身姿来给 arm 腾出空间，不能简单归因于“模型还没学会”。
+
+当前训练确实允许腿部策略间接受到 arm reward 的影响，但没有显式训练“遇到雷达遮挡时主动蹲下、侧身或调整 body pose”：
+
+- arm 输出在 [`manip_loco.py:146`](/root/rivermind-data/visual_wholebody/low-level/legged_gym/envs/manip_loco/manip_loco.py:146) 以后由 IK 控制；
+- PPO 的后 6 维 arm action 在 [`manip_loco.py`](/root/rivermind-data/visual_wholebody/low-level/legged_gym/envs/manip_loco/manip_loco.py:120) 被置零；
+- 腿部只能通过混合后的 arm advantage 间接受到 EE tracking 信号；
+- `recovery_progress` 和 `radar_clearance_violation` 只是间接的 clearance reward；
+- 当前 `workspace_radar` 还继承了 `feet_height=0.0`、`walking_dof=0.9`，没有专门鼓励前腿主动下蹲或改变 body posture。
+
+因此更准确的判断是：
+
+> 当前模型既没有充分学会 body recovery，也没有被明确教会在“arm 已经被雷达挡住”时调整身体姿态。
+
+而且增强回放中已经出现：
+
+```text
+waypoint=1
+radar clearance < 0
+```
+
+这说明即使 waypoint planner 已经触发，当前 arm link 仍然碰撞。此时问题不只是 leg policy 没动，而是 planner 本身没有提供“从碰撞状态逃逸”的可行参考。
+
+下一步应该优先做：
+
+```text
+当前碰撞状态
+    -> 先生成安全逃逸姿态/逃逸 waypoint
+    -> 再生成绕行路径
+    -> 同时用 arm link swept clearance 检查
+    -> 再通过 recovery curriculum 训练 body/leg 配合
+```
+
+所以我不建议现在直接把 waypoint 从 2 个增加到 10 个。先解决“碰撞起点无法逃逸”和“只检查 EE、不检查整条机械臂”这两个根本问题。
+
+是的，路径需要改得更平滑，但不建议简单把两个 waypoint 复制成 10 个点。当前问题有两个来源：
+
+1. **路径参考本身是跳变的**
+
+在 [`manip_loco.py:1730`](/root/rivermind-data/visual_wholebody/low-level/legged_gym/envs/manip_loco/manip_loco.py:1730) 中，planner 一旦激活，就直接把 IK 目标设为 waypoint：
+
+```python
+self.curr_ee_goal_cart_world[self.waypoint_active] = waypoint_world[...]
+```
+
+而 IK 的位置误差直接在 [`manip_loco.py:146`](/root/rivermind-data/visual_wholebody/low-level/legged_gym/envs/manip_loco/manip_loco.py:146) 计算：
+
+```python
+dpos = self.curr_ee_goal_cart_world - self.ee_pos
+```
+
+因此 waypoint 距离较大时，机械臂会产生较大的瞬时动作。`_path_clearance(..., samples=32)` 的 32 个点只是碰撞检测采样，不是控制轨迹点。
+
+建议改为：
+
+- 保留当前候选路径选择；
+- 把选中的三段折线路径按弧长重新采样成最多 8 到 10 个点；
+- 相邻点距离限制在约 `0.05~0.08 m`；
+- 增加 `waypoint_index`，每次只追踪下一个点；
+- 到达当前点后再切换下一个点；
+- 每个点切换时保留最小 clearance；
+- 必要时对折线拐角做圆滑过渡，但过渡后的曲线仍要重新进行碰撞检查。
+
+这样 10 个点表示的是一条平滑、受步长限制的参考轨迹，而不是 10 个独立的突变目标。
+
+第二个问题，**不能简单认为只是 model 4000 还没学会调整身体姿态**。
+
+当前确实存在“训练还早”的因素，但不是唯一原因：
+
+- `mixing_schedule=[0.5, 2000, 2000]`，4000 iteration 才刚达到最大 `0.5` 混合比例；
+- arm action 在 [`manip_loco.py:120`](/root/rivermind-data/visual_wholebody/low-level/legged_gym/envs/manip_loco/manip_loco.py:120) 被置零，机械臂实际由 IK 控制；
+- 腿部只能通过 arm advantage 间接受到 EE reward 的影响；
+- `workspace_radar` 继承的是 `feet_height=0.0`、`walking_dof=0.9`，并没有明显鼓励前腿主动下蹲或改变姿态。
+
+更关键的是：雷达和机械臂基座都固定在机器人机身上。当前目标和 waypoint 也是相对于机身定义的。因此单纯让机身 roll/pitch 或上下移动，并不会显著改变“机械臂相对于雷达”的几何关系。身体姿态可以帮助地面稳定性、目标相对世界位置和 IK 可行性，但不能替代机械臂绕过一个固定在机身上的雷达。
+
+所以结论是：
+
+- **不需要单独增加一个 body-recovery policy 模块**，whole-body PPO 理论上可以保留；
+- 但不能期待仅靠继续训练就自动学会绕雷达，因为当前参考路径只保证 EE 中心点，且 body action 对 base-mounted radar 的相对几何作用很弱；
+- 必须先提供平滑、可行、对整条 arm link 做过碰撞验证的参考路径；
+- 之后再观察 leg advantage 是否学会配合。如果仍没有 body 调整，再考虑增加更明确的 body/leg clearance 或姿态 reward。
+
+当前正在运行的训练进程不会自动加载这些 planner 修改；平滑 waypoint 实现完成后，需要用新实验重新训练或至少重新回放验证。
+
+是的，修改基于当前 `b2_z1_reachable_workspace_radar` 版本，没有把 balanced 的 workspace、腿部 reward 或训练参数混入。
+
+已完成：
+
+- 将原先 `EE -> waypoint1 -> waypoint2 -> goal` 的跳变参考改为最多 10 个等弧长 route 点；
+- 对折线路径做两轮圆角平滑；平滑后逐段重新检查 clearance，不安全则回退原安全折线；
+- route 点依次到达，`0.04 m` 容差；
+- IK 参考每个 control step 最大移动 `0.02 m`，避免大动作跳变；
+- `workspace_radar` 的 `mixing_schedule` 改为 `[1.0, 0, 3000]`；
+- 视频绘制同步显示 10 点平滑 route 与当前 route index。
+
+配置在 [b2z1_config.py](/root/rivermind-data/visual_wholebody/low-level/legged_gym/envs/manip_loco/b2z1_config.py:160)，路径逻辑在 [manip_loco.py](/root/rivermind-data/visual_wholebody/low-level/legged_gym/envs/manip_loco/manip_loco.py:1457)。
+
+验证通过：
+
+```text
+num_recovery_waypoints = 10
+mixing_schedule = [1.0, 0, 3000]
+左右跨雷达的平滑路径最小 clearance = +0.120 m
+最后一个 route 点到最终目标误差 = 0
+```
+
+当前运行中的 `b2_z1_workspace_radar_20260823` 是旧代码，未受影响。新路径和新 mixing 仅会在重新启动该任务后生效。

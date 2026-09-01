@@ -54,3 +54,23 @@ def torch_rand_sqrt_float(lower, upper, shape, device):
     r = torch.where(r<0., -torch.sqrt(-r), torch.sqrt(r))
     r =  (r + 1.) / 2.
     return (upper - lower) * r + lower
+
+
+def sphere2cart(sphere_coords):
+    l = sphere_coords[:, 0]
+    pitch = sphere_coords[:, 1]
+    yaw = sphere_coords[:, 2]
+    cart_coords = torch.zeros_like(sphere_coords)
+    cart_coords[:, 0] = l * torch.cos(pitch) * torch.cos(yaw)
+    cart_coords[:, 1] = l * torch.cos(pitch) * torch.sin(yaw)
+    cart_coords[:, 2] = l * torch.sin(pitch)
+    return cart_coords
+
+
+def cart2sphere(cart_coords):
+    sphere_coords = torch.zeros_like(cart_coords)
+    xy_len = torch.norm(cart_coords[:, :2], dim=1)
+    sphere_coords[:, 0] = torch.norm(cart_coords, dim=1)
+    sphere_coords[:, 1] = torch.atan2(cart_coords[:, 2], xy_len)
+    sphere_coords[:, 2] = torch.atan2(cart_coords[:, 1], cart_coords[:, 0])
+    return sphere_coords

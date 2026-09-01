@@ -164,7 +164,7 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
 
 def get_args(test=False):
     custom_parameters = [
-        {"name": "--task", "type": str, "default": "widowGo1", "help": "Resume training or start testing from a checkpoint. Overrides config file if provided."},
+        {"name": "--task", "type": str, "default": "b2z1", "help": "Resume training or start testing from a checkpoint. Overrides config file if provided."},
         {"name": "--resume", "action": "store_true", "default": False,  "help": "Resume training from a checkpoint"},
         {"name": "--experiment_name", "type": str,  "help": "Name of the experiment to run or load. Overrides config file if provided."},
         {"name": "--run_name", "type": str,  "required": False,  "help": "Name of the run. Overrides config file if provided."},
@@ -175,7 +175,7 @@ def get_args(test=False):
         
         {"name": "--exptid", "type": str,  "required": True if not test else False,  "help": "Experiment ID"},
         {"name": "--debug", "action": "store_true", "default": False, "help": "Disable wandb logging"},
-        {"name": "--proj_name", "type": str,  "default": "b1z1-low", "help": "run folder name."},
+        {"name": "--proj_name", "type": str,  "default": "b2z1-low", "help": "run folder name."},
         {"name": "--resumeid", "type": str, "help": "exptid"},
 
         {"name": "--headless", "action": "store_true", "default": True, "help": "Force display off at all times"},
@@ -187,6 +187,7 @@ def get_args(test=False):
         {"name": "--stochastic", "action": "store_true", "default": False, "help": "Use stochastic actions to play"},
         {"name": "--use_jit", "action": "store_true", "default": False,  "help": "Use jit to play"},
         {"name": "--record_video", "action": "store_true", "default": False,  "help": "Record video to play"},
+        {"name": "--video_length", "type": float, "default": 30.0, "help": "Length of the recorded video in seconds (default 30.0)"},
         {"name": "--stand_by", "action": "store_true", "default": False,  "help": "Stand by to play"},
         {"name": "--flat_terrain", "action": "store_true", "default": False,  "help": "Flat the terrain"},
         {"name": "--pitch_control", "action": "store_true", "default": False,  "help": "Control Pitch"},

@@ -1,0 +1,62 @@
+
+
+
+cd legged_gym/scripts
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+python train.py --headless --exptid b2_z1 --proj_name b2z1-low --task b2z1 --sim_device cuda:0 --rl_device cuda:0 --observe_gait_commands
+
+
+cd legged_gym/scripts
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+python train.py  \
+  --exptid MARL_b2_z1_5D_base_command_2 --proj_name b2z1-low --task b2z1 \
+  --sim_device cuda:0 \
+  --rl_device cuda:0 \
+  --observe_gait_commands \
+  --headless
+
+
+
+
+  
+   \
+  --num_envs 256 \
+  --max_iterations 200
+
+
+--headless\
+
+python train.py \
+  --debug \
+  --exptid b2z1_debug \
+  --proj_name b2z1-low \
+  --task b2z1 \
+  --sim_device cuda:0  \
+  --rl_device cuda:0  \
+  --max_iterations 10 \
+  --observe_gait_commands
+
+
+python play.py --exptid MARL_b2_z1_5D_base_command_2 --task b2z1 --proj_name b2z1-low --checkpoint 45000 --sim_device cpu --rl_device cpu --observe_gait_commands --record_video
+
+
+python train.py  \
+  --exptid MARL_b2_z1_5D_base_command --proj_name b2z1-low --task b2z1 \
+  --sim_device cuda:1 \
+  --rl_device cuda:1 \
+  --observe_gait_commands \
+  --headless
+
+python play.py --exptid MARL_b2_z1_5D_base_command_2 --task b2z1 --proj_name b2z1-low --checkpoint 45000  --observe_gait_commands
+
+
+python play.py --exptid MARL_b2_z1_5D_base_command --task b2z1 --proj_name b2z1-low --checkpoint 45000 --observe_gait_commands
+
+
+python play.py --exptid b2_z1 --task b2z1 --proj_name b2z1-low --checkpoint 45000 --observe_gait_commands --sim_device cuda:0 --rl_device cuda:0  --record_video
+
+python train.py --headless --exptid b2_z1 --proj_name b2z1-low --task b2z1 --sim_device cuda:0 --rl_device cuda:0 --observe_gait_commands 
+
+low-level/legged_gym/scripts/visualize_b2_z1_urdf.py 可视化b2_z1脚本 
+
+为啥么站立不动啊，没找到原因。。。

@@ -43,6 +43,11 @@ from rsl_rl.env import VecEnv
 import wandb
 from torchinfo import summary
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
+
 class OnPolicyRunner:
 
     def __init__(self,
@@ -85,10 +90,16 @@ class OnPolicyRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.dagger_update_freq = self.alg_cfg["dagger_update_freq"]
+        self.progress_bar = None
 
         _, _ = self.env.reset()
 
-        self.alg.set_arm_default_coeffs(self.env.p_gains[12:], self.env.d_gains[12:], self.env.default_dof_pos[-7:-2])
+        arm_dof_slice = self.env._arm_dof_slice()
+        self.alg.set_arm_default_coeffs(
+            self.env.p_gains[arm_dof_slice],
+            self.env.d_gains[arm_dof_slice],
+            self.env.default_dof_pos[arm_dof_slice],
+        )
         
     def set_it(self, it):
         self.current_learning_iteration = it
@@ -124,8 +135,20 @@ class OnPolicyRunner:
         cur_arm_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
-        tot_iter = self.current_learning_iteration + num_learning_iterations
-        for it in range(self.current_learning_iteration, tot_iter):
+        start_iter = self.current_learning_iteration
+        tot_iter = start_iter + num_learning_iterations
+        iterations = range(start_iter, tot_iter)
+        if tqdm is not None:
+            iterations = tqdm(
+                iterations,
+                total=num_learning_iterations,
+                desc="Training",
+                dynamic_ncols=True,
+                leave=True,
+            )
+            self.progress_bar = iterations
+
+        for it in iterations:
             # self.env.update_command_curriculum()
 
             start = time.time()
@@ -175,12 +198,23 @@ class OnPolicyRunner:
             learn_time = stop - start
             if self.log_dir is not None:
                 self.log(locals())
+            if self.progress_bar is not None:
+                postfix = {
+                    "fps": int(self.num_steps_per_env * self.env.num_envs / (collection_time + learn_time)),
+                    "v_loss": f"{mean_value_loss:.3f}",
+                    "surr": f"{mean_surrogate_loss:.3f}",
+                }
+                if len(rewbuffer) > 0:
+                    postfix["rew"] = f"{statistics.mean(rewbuffer):.2f}"
+                    postfix["arm"] = f"{statistics.mean(armrewbuffer):.2f}"
+                self.progress_bar.set_postfix(postfix)
             if it % self.save_interval == 0:
                 self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)), it)
             ep_infos.clear()
         
         self.current_learning_iteration += num_learning_iterations
         self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)), self.current_learning_iteration)
+        self.progress_bar = None
 
     def log(self, locs, width=80, pad=35):
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
@@ -277,7 +311,10 @@ class OnPolicyRunner:
                        f"""{'Total time:':>{pad}} {self.tot_time:.2f}s\n"""
                        f"""{'ETA:':>{pad}} {self.tot_time / (locs['it'] + 1) * (
                                locs['num_learning_iterations'] - locs['it']):.1f}s\n""")
-        print(log_string)
+        if self.progress_bar is not None:
+            self.progress_bar.write(log_string)
+        else:
+            print(log_string)
 
     def save(self, path, it, infos=None):
         torch.save({
