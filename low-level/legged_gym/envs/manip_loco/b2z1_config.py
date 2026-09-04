@@ -78,6 +78,9 @@ class B2Z1RoughCfg(B1Z1RoughCfg):
 
     class rewards(B1Z1RoughCfg.rewards):
         base_height_target = 0.55
+        # No height penalty inside this interval. Outside it, penalize only
+        # the distance to the nearest boundary.
+        base_height_range = [0.40, 0.60]
 
         class scales(B1Z1RoughCfg.rewards.scales):
             walking_dof = 1.0
@@ -86,6 +89,7 @@ class B2Z1RoughCfg(B1Z1RoughCfg):
             tracking_lin_vel_max = 2.5
             tracking_ang_vel = 0.5
             torques = -1.0e-5
+            collision = -1.0
 
 class B2Z1RoughCfgPPO(B1Z1RoughCfgPPO):
     class policy(B1Z1RoughCfgPPO.policy):

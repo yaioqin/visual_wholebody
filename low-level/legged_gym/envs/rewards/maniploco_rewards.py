@@ -229,12 +229,20 @@ class ManipLoco_rewards:
         return error, error
     
     def _reward_base_height(self):
-        # Penalize base height away from target
+        # Penalize base height outside an optional dead-band. Configurations
+        # without a range retain the original point-target behavior.
         base_height = torch.mean(
             self.env.root_states[:, 2].unsqueeze(1) - self.env.measured_heights,
             dim=1,
         )
-        return torch.abs(base_height - self.env.cfg.rewards.base_height_target), base_height
+        height_range = getattr(self.env.cfg.rewards, "base_height_range", None)
+        if height_range is None:
+            height_error = torch.abs(base_height - self.env.cfg.rewards.base_height_target)
+        else:
+            min_height, max_height = height_range
+            height_error = torch.clamp(min_height - base_height, min=0.0)
+            height_error += torch.clamp(base_height - max_height, min=0.0)
+        return height_error, base_height
     
     def _reward_orientation_walking(self):
         reward, metric = self.env._reward_orientation()
