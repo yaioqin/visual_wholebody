@@ -1,0 +1,24 @@
+<launch>
+  <arg name="config" default="$(find b2z1_real)/config/b2z1_real.yaml"/>
+  <arg name="policy" default="$(find b2z1_real)/models/policy_b2z1.pt"/>
+  <arg name="start_hardware_bridges" default="false"/>
+  <arg name="b2_network_interface" default="eth0"/>
+  <arg name="release_b2_motion_service" default="false"/>
+
+  <node pkg="b2z1_real" type="b2z1_policy_node.py" name="b2z1_policy" output="screen">
+    <rosparam command="load" file="$(arg config)"/>
+    <param name="policy_path" value="$(arg policy)"/>
+  </node>
+
+  <group if="$(arg start_hardware_bridges)">
+    <node pkg="b2z1_real" type="b2_sdk2_bridge" name="b2_sdk2_bridge" output="screen">
+      <rosparam command="load" file="$(arg config)"/>
+      <param name="b2_bridge/network_interface" value="$(arg b2_network_interface)"/>
+      <param name="b2_bridge/release_motion_service" value="$(arg release_b2_motion_service)"/>
+    </node>
+
+    <node pkg="b2z1_real" type="z1_sdk_bridge" name="z1_sdk_bridge" output="screen">
+      <rosparam command="load" file="$(arg config)"/>
+    </node>
+  </group>
+</launch>

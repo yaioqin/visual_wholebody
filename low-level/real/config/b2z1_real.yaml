@@ -1,0 +1,89 @@
+# Parameters matching:
+# python train.py --task b2z1 --observe_gait_commands ...
+control_rate: 50.0
+control_dt: 0.02
+policy_path: ""
+policy_device: cpu
+
+topics:
+  b2_state: /b2/low_state
+  b2_command: /b2/low_command
+  z1_state: /z1/low_state
+  z1_command: /z1/low_command
+  velocity_command: /cmd_vel
+  ee_goal: /b2z1/ee_goal_vector
+  base_height: /b2z1/base_height
+  enable: /b2z1/enable
+  emergency_stop: /b2z1/emergency_stop
+
+robot:
+  # Unitree SDK order: FR, FL, RR, RL; hip, thigh, calf per leg.
+  default_leg_position: [-0.1, 0.8, -1.5, 0.1, 0.8, -1.5, -0.1, 1.0, -1.5, 0.1, 1.0, -1.5]
+  default_arm_position: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  arm_mount_offset: [0.34218, 0.0, 0.23851]
+  action_scale: [0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.35]
+  leg_kp: [250.0, 250.0, 250.0, 250.0, 250.0, 250.0, 250.0, 250.0, 250.0, 250.0, 250.0, 250.0]
+  leg_kd: [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
+
+observation:
+  dof_pos_scale: 1.0
+  dof_vel_scale: 0.05
+  ang_vel_scale: 1.0
+  contact_threshold: 1.5
+  clip: 100.0
+  gait_frequency: 2.0
+  walking_linear_threshold: 0.2
+  walking_yaw_threshold: 0.5
+
+command:
+  max_linear_x: 0.5
+  max_yaw_rate: 0.8
+  timeout: 0.5
+
+goal:
+  # Raw Cartesian vector converted from curr_ee_goal_sphere, before adding the sphere center.
+  frame_id: b2_base_yaw
+  default_vector: [0.4619397663, 0.0, 0.1913417162]
+  sphere_center_offset: [0.2, 0.0, 0.8]
+  assumed_base_height: 0.55
+  arm_induced_pitch: 0.38
+  radius_range: [0.45, 0.95]
+  pitch_range: [-1.2566370614, 1.0471975512]
+  yaw_range: [-0.75, 0.75]
+  collision_lower: [-0.8, -0.2, -0.7]
+  collision_upper: [0.1, 0.2, -0.05]
+  underground_limit: -0.7
+  collision_check_samples: 10
+
+deployment:
+  action_clip: 1.0
+  action_delay_steps: 1
+  arming_duration: 3.0
+  initial_max_leg_error: 0.8
+  leg_target_velocity_limit: 8.0
+  arm_target_velocity_limit: 1.0
+  ik_damping: 0.05
+  joint_limit_margin: 0.03
+
+safety:
+  state_timeout: 0.10
+  max_roll: 0.50
+  max_pitch: 0.50
+  max_leg_temperature: 80.0
+  max_arm_temperature: 75.0
+  leg_lower_limits: [-0.87, -0.94, -2.82, -0.87, -0.94, -2.82, -0.87, -0.94, -2.82, -0.87, -0.94, -2.82]
+  leg_upper_limits: [0.87, 4.69, -0.43, 0.87, 4.69, -0.43, 0.87, 4.69, -0.43, 0.87, 4.69, -0.43]
+  arm_lower_limits: [-2.6179938780, 0.0, -2.8797932658, -1.5184364492, -1.3439035240, -2.7925268032]
+  arm_upper_limits: [2.6179938780, 2.9670597284, 0.0, 1.5184364492, 1.3439035240, 2.7925268032]
+
+b2_bridge:
+  network_interface: eth0
+  command_rate: 500.0
+  command_timeout: 0.10
+  release_motion_service: false
+  damping_kd: 8.0
+
+z1_bridge:
+  has_gripper: true
+  state_rate: 250.0
+  command_timeout: 0.10

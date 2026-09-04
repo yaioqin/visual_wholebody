@@ -53,10 +53,18 @@ python play.py --exptid MARL_b2_z1_5D_base_command_2 --task b2z1 --proj_name b2z
 python play.py --exptid MARL_b2_z1_5D_base_command --task b2z1 --proj_name b2z1-low --checkpoint 45000 --observe_gait_commands
 
 
-python play.py --exptid b2_z1 --task b2z1 --proj_name b2z1-low --checkpoint 45000 --observe_gait_commands --sim_device cuda:0 --rl_device cuda:0  --record_video
-
+python play.py --exptid b2_z1 --task b2z1 --proj_name b2z1-low --checkpoint 28000 --observe_gait_commands --sim_device cuda:0 --rl_device cuda:0  --record_video
+python play.py --exptid b2_z1 --task b2z1 --proj_name b2z1-low --checkpoint 28000 --observe_gait_commands --sim_device cuda:0 --rl_device cuda:0  
 python train.py --headless --exptid b2_z1 --proj_name b2z1-low --task b2z1 --sim_device cuda:0 --rl_device cuda:0 --observe_gait_commands 
 
+
+--headless 
 low-level/legged_gym/scripts/visualize_b2_z1_urdf.py 可视化b2_z1脚本 
 
-为啥么站立不动啊，没找到原因。。。
+
+pip uninstall skrl rsl_rl  legged_gym  isaacgym 
+
+python visualize_b2_z1_urdf.py \
+  --asset-file /home/ubuntu22/E/visual_wholebody/low-level/resources/robots/b2_z1_lidar_mount/urdf/b2_z1_lidar_mount.urdf \
+  --fix-base \
+  --sim-device cuda:0

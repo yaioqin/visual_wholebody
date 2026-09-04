@@ -1,0 +1,13 @@
+std_msgs/Header header
+geometry_msgs/Quaternion orientation
+geometry_msgs/Vector3 angular_velocity
+geometry_msgs/Vector3 linear_acceleration
+float64[3] rpy
+float64[12] q
+float64[12] dq
+float64[12] tau_est
+float64[4] foot_force
+uint8[12] motor_temperature
+uint32 tick
+bool crc_ok
+bool valid

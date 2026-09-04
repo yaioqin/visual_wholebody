@@ -65,15 +65,16 @@ class B2Z1RoughCfg(B1Z1RoughCfg):
         action_scale = [0.35] * 12 + [0.25] * 6
 
     class asset(B1Z1RoughCfg.asset):
-        file = '{LEGGED_GYM_ROOT_DIR}/resources/robots/b2_z1/urdf/b2_z1.urdf'
+        file = '{LEGGED_GYM_ROOT_DIR}/resources/robots/b2_z1_lidar_mount_fast/urdf/b2_z1_lidar_mount_fast.urdf'
         base_name = "base_link"
         foot_name = "foot"
         gripper_name = "gripperMover"
+        self_collisions = 0 # 1 to disable, 0 to enable...bitwise filter
         penalize_contacts_on = ["thigh", "base_link", "calf"]
         collapse_fixed_joints = False
 
     class arm(B1Z1RoughCfg.arm):
-        base_offset = [0.0, 0.0, 0.09]
+        base_offset = [0.34218, 0.0, 0.23851]
 
     class rewards(B1Z1RoughCfg.rewards):
         base_height_target = 0.55
