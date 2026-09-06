@@ -120,3 +120,5 @@ python train.py \
 
 
 3D_ma2b_mani_vx_dq_weight 
+
+python play.py --task b1z1 --proj_name b1z1-low --exptid low_model --checkpoint 44000 --sim_device cuda:0 --pipeline gpu --rl_device cuda:0 --headless --num_envs 256 --observe_gait_commands --pfg_enabled --manipulability_enabled --eval_coordination --eval_coverage --eval_coverage_mode joint --eval_num_samples 4096 --eval_deterministic --hard_case_mining --eval_out_dir logs/hard_case_eval/low_model_joint_44000

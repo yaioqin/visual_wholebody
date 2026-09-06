@@ -453,9 +453,14 @@ class CoordinationMetrics:
         self.episodes_finished = torch.zeros((), device=self.device, dtype=torch.float64)
         self.episode_success_count = torch.zeros((), device=self.device, dtype=torch.float64)
         self.episode_survival_count = torch.zeros((), device=self.device, dtype=torch.float64)
+        self.sample_collision_count = torch.zeros((), device=self.device, dtype=torch.float64)
         self.current_episode_success = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self.current_episode_alive = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
         self.current_episode_steps = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self.sample_mode = False
+        self.coverage_sample_mode_used = False
+        self.excluded_sample_warmup_steps = 0
+        self._active_mask = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
 
         self.prev_actions: Optional[torch.Tensor] = None
         self.prev_arm_motion_signal: Optional[torch.Tensor] = None
@@ -476,9 +481,64 @@ class CoordinationMetrics:
     def add_warning(self, message: str) -> None:
         self._warn_once(message)
 
-    def update(self, env: Any, actions: torch.Tensor, obs: Optional[torch.Tensor] = None) -> None:
+    def begin_sample_batch(self, active_mask: torch.Tensor) -> None:
+        """Start independent per-env samples and clear cross-sample state."""
+        active_mask = active_mask.to(device=self.device, dtype=torch.bool)
+        if active_mask.shape != (self.num_envs,):
+            raise ValueError("active_mask must have shape [num_envs]")
+        self.sample_mode = True
+        self.coverage_sample_mode_used = True
+        self._active_mask = active_mask
+        self.current_episode_success[active_mask] = False
+        self.current_episode_alive[active_mask] = True
+        self.current_episode_steps[active_mask] = 0
+        self.prev_actions = None
+        self.prev_arm_motion_signal = None
+        self.prev_base_ang_vel = None
+        self.prev_base_lin_vel = None
+
+    def end_sample_batch(
+        self,
+        active_mask: torch.Tensor,
+        *,
+        success_mask: torch.Tensor,
+        fall_mask: torch.Tensor,
+        collision_mask: torch.Tensor,
+    ) -> None:
+        """Finalize one coverage sample per active environment."""
+        active_mask = active_mask.to(device=self.device, dtype=torch.bool)
+        success_mask = success_mask.to(device=self.device, dtype=torch.bool) & active_mask
+        fall_mask = fall_mask.to(device=self.device, dtype=torch.bool) & active_mask
+        collision_mask = collision_mask.to(device=self.device, dtype=torch.bool) & active_mask
+        self.episodes_finished += active_mask.float().sum()
+        self.episode_success_count += success_mask.float().sum()
+        self.episode_survival_count += (active_mask & ~fall_mask).float().sum()
+        self.sample_collision_count += collision_mask.float().sum()
+        self.current_episode_success[active_mask] = False
+        self.current_episode_alive[active_mask] = True
+        self.current_episode_steps[active_mask] = 0
+        self.sample_mode = False
+
+    def update(
+        self,
+        env: Any,
+        actions: torch.Tensor,
+        obs: Optional[torch.Tensor] = None,
+        *,
+        active_mask: Optional[torch.Tensor] = None,
+        fall_mask: Optional[torch.Tensor] = None,
+        collision_mask: Optional[torch.Tensor] = None,
+    ) -> None:
         del obs
         self.rollout_steps += 1
+
+        if active_mask is None:
+            active_mask = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
+        else:
+            active_mask = active_mask.to(device=self.device, dtype=torch.bool)
+        if active_mask.shape != (self.num_envs,):
+            raise ValueError("active_mask must have shape [num_envs]")
+        self._active_mask = active_mask
 
         actions = self._batch_tensor(actions, "actions")
         base_lin_vel = self._get_base_lin_vel(env)
@@ -490,41 +550,53 @@ class CoordinationMetrics:
             return
 
         self.eval_steps += 1
-        self.total_samples += self.num_envs
-        all_mask = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
+        self.total_samples += active_mask.float().sum()
 
         commands = self._get_commands(env)
         vx_err, vy_err, yaw_err, vel_l1 = self._update_velocity_metrics(base_lin_vel, base_ang_vel, commands)
 
         base_height = self._get_base_height(env)
         reset_event, timeout_mask = self._get_reset_masks(env)
-        collision_mask = self._get_collision_mask(env)
+        collision_override = collision_mask
+        fall_override = fall_mask
+        collision_mask = (
+            collision_override.to(device=self.device, dtype=torch.bool)
+            if collision_override is not None
+            else self._get_collision_mask(env)
+        )
         fall_mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         if base_height is not None:
-            fall_mask |= base_height < self.fall_height_thr
-            self.acc.add("base_height", base_height)
+            if fall_override is None:
+                fall_mask |= base_height < self.fall_height_thr
+            self._add_metric("base_height", base_height)
             self._append_history("base_height", base_height)
             self._append_traj("base_height", base_height)
         else:
             self._skip_once("stability/base_height", "base height tensor not found")
 
         termination = self._get_bool_tensor(env, ["termination_buf"])
-        if termination is not None:
-            fall_mask |= termination
-        if reset_event is not None:
-            if timeout_mask is not None:
-                fall_mask |= reset_event & ~timeout_mask
-            else:
-                fall_mask |= reset_event
-        elif base_height is None and termination is None:
-            self._skip_once("stability/survival_rate_step", "no base height or reset tensor found")
+        if fall_override is not None:
+            fall_mask = fall_override.to(device=self.device, dtype=torch.bool)
+        else:
+            if termination is not None:
+                fall_mask |= termination
+            if reset_event is not None:
+                if timeout_mask is not None:
+                    fall_mask |= reset_event & ~timeout_mask
+                else:
+                    fall_mask |= reset_event
+            elif base_height is None and termination is None:
+                self._skip_once("stability/survival_rate_step", "no base height or reset tensor found")
 
-        if collision_mask is not None:
-            fall_mask |= collision_mask
-
+        fall_mask &= active_mask
         alive_mask = ~fall_mask
-        self.acc.add("survival", alive_mask.float())
-        self.acc.add("fall", fall_mask.float())
+        self._add_metric("survival", alive_mask.float())
+        self._add_metric("fall", fall_mask.float())
+        if collision_mask is not None:
+            collision_mask &= active_mask
+            self._add_metric("collision", collision_mask.float())
+        else:
+            self._skip_once("stability/collision_rate_step", "collision tensor not found")
 
         base_rpy = self._get_base_rpy(env)
         base_roll = base_rpy[:, 0] if base_rpy is not None else None
@@ -545,13 +617,16 @@ class CoordinationMetrics:
                 (ee_pos_err <= self.success_pos_thr)
                 & (ee_ori_err <= self.success_ori_thr)
                 & success_alive
+                & active_mask
             )
-            self.acc.add("ee_success_step", success_mask.float())
+            self._add_metric("ee_success_step", success_mask.float())
             self._append_history("success_mask", success_mask.float())
             self._append_traj("success_mask", success_mask.float())
             points = target_ee_pos if target_ee_pos is not None else self._get_ee_actual_pos(env)
             if points is not None:
-                self.success_points.append(points[success_mask].detach())
+                local_points = self._world_points_to_base_frame(env, points)
+                if local_points is not None:
+                    self.success_points.append(local_points[success_mask].detach())
         else:
             self._skip_once("ee/success_rate", "EE position or orientation error unavailable")
 
@@ -566,11 +641,11 @@ class CoordinationMetrics:
         if actions is not None and self.prev_actions is not None:
             delta = actions - self.prev_actions
             total_action_rate = torch.linalg.norm(delta, dim=-1) / max(self.dt, 1.0e-9)
-            self.acc.add("total_action_rate", total_action_rate)
+            self._add_metric("total_action_rate", total_action_rate)
             if self.leg_action_indices.numel() > 0:
                 leg_delta = delta.index_select(1, self._valid_indices(self.leg_action_indices, delta.shape[1]))
                 leg_action_rate = torch.linalg.norm(leg_delta, dim=-1) / max(self.dt, 1.0e-9)
-                self.acc.add("leg_action_rate", leg_action_rate)
+                self._add_metric("leg_action_rate", leg_action_rate)
         elif actions is None:
             self._skip_once("smoothness/action_rate", "actions tensor unavailable")
         if arm_motion_signal is not None and self.prev_arm_motion_signal is not None:
@@ -580,8 +655,8 @@ class CoordinationMetrics:
                 arm_action_rate = torch.linalg.norm(arm_motion_delta, dim=-1) / max(self.dt, 1.0e-9)
                 arm_action_delta = torch.linalg.norm(arm_motion_delta, dim=-1)
                 arm_action_norm = torch.linalg.norm(arm_motion_signal[:, :dim], dim=-1)
-                self.acc.add("arm_action_rate", arm_action_rate)
-                self.acc.add("arm_motion_rate", arm_action_rate)
+                self._add_metric("arm_action_rate", arm_action_rate)
+                self._add_metric("arm_motion_rate", arm_action_rate)
         elif arm_motion_signal is None:
             self._skip_once("smoothness/arm_motion_rate", "arm target/action signal unavailable")
 
@@ -614,10 +689,15 @@ class CoordinationMetrics:
             "meta/num_envs": self.num_envs,
             "meta/eval_steps": self.eval_steps,
             "meta/warmup_steps": self.warmup_steps,
+            "meta/excluded_warmup_steps_per_sample": self.excluded_sample_warmup_steps,
             "meta/dt": self.dt,
             "meta/total_samples": self._scalar(self.total_samples),
             "meta/arm_motion_source": self.arm_motion_source,
             "meta/arm_energy_source": self.arm_energy_source,
+            "meta/aggregation_unit": (
+                "coverage_sample" if self.coverage_sample_mode_used else "episode"
+            ),
+            "workspace/frame": "base_local_xyzw",
         }
 
         summary.update(
@@ -658,6 +738,7 @@ class CoordinationMetrics:
 
         episode_total, episode_success, episode_survival = self._episode_totals()
         summary["ee/success_rate_episode"] = self._safe_ratio(episode_success, episode_total)
+        summary["ee/success_rate_sample"] = self._safe_ratio(episode_success, episode_total)
         t_success = self._cat_history_list(self.time_to_success)
         if t_success.numel() > 0:
             summary["ee/time_to_success_mean"] = self._scalar(t_success.mean())
@@ -673,7 +754,12 @@ class CoordinationMetrics:
             {
                 "stability/survival_rate_step": self._scalar(self.acc.mean("survival")),
                 "stability/fall_rate_step": self._scalar(self.acc.mean("fall")),
+                "stability/collision_rate_step": self._scalar(self.acc.mean("collision")),
                 "stability/episode_survival_rate": self._safe_ratio(episode_survival, episode_total),
+                "stability/sample_survival_rate": self._safe_ratio(episode_survival, episode_total),
+                "stability/sample_collision_rate": self._safe_ratio(
+                    self.sample_collision_count, episode_total
+                ),
                 "stability/base_height_mean": base_height_stats["mean"],
                 "stability/base_height_min": base_height_stats["min"],
                 "stability/base_height_p05": base_height_stats["p_low"],
@@ -847,6 +933,30 @@ class CoordinationMetrics:
             return base_pos[:, 2]
         return None
 
+    def _world_points_to_base_frame(
+        self, env: Any, points: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        root_states = self._batch_tensor(
+            safe_get_tensor(env, ["root_states"]), "root_states"
+        )
+        base_pos = self._batch_tensor(
+            safe_get_tensor(env, ["base_pos", "base_position"]), "base position"
+        )
+        base_quat = self._batch_tensor(
+            safe_get_tensor(env, ["base_quat"]), "base_quat"
+        )
+        if base_pos is None and root_states is not None and root_states.shape[-1] >= 3:
+            base_pos = root_states[:, :3]
+        if base_quat is None and root_states is not None and root_states.shape[-1] >= 7:
+            base_quat = root_states[:, 3:7]
+        if base_pos is None or base_quat is None or base_quat.shape[-1] != 4:
+            self._skip_once(
+                "workspace/base_local_frame",
+                "base position or quaternion unavailable; successful points omitted",
+            )
+            return None
+        return _quat_apply_inverse_xyzw(base_quat[:, :4], points[:, :3] - base_pos[:, :3])
+
     def _get_base_rpy(self, env: Any) -> Optional[torch.Tensor]:
         base_rpy = self._batch_tensor(safe_get_tensor(env, ["base_rpy"]), "base_rpy")
         if base_rpy is not None and base_rpy.shape[-1] >= 3:
@@ -1002,20 +1112,20 @@ class CoordinationMetrics:
 
         if base_lin_vel is not None and base_lin_vel.shape[-1] >= 1 and commands.shape[-1] >= 1:
             vx_err = torch.abs(base_lin_vel[:, 0] - commands[:, 0])
-            self.acc.add("vx_err", vx_err)
+            self._add_metric("vx_err", vx_err)
         if base_lin_vel is not None and base_lin_vel.shape[-1] >= 2 and commands.shape[-1] >= 3:
             vy_err = torch.abs(base_lin_vel[:, 1] - commands[:, 1])
-            self.acc.add("vy_err", vy_err)
+            self._add_metric("vy_err", vy_err)
         else:
             self._skip_once("vel/vy", "vy command unavailable")
         yaw_idx = 2 if commands.shape[-1] >= 3 else (1 if commands.shape[-1] >= 2 else None)
         if base_ang_vel is not None and base_ang_vel.shape[-1] >= 3 and yaw_idx is not None:
             yaw_err = torch.abs(base_ang_vel[:, 2] - commands[:, yaw_idx])
-            self.acc.add("yaw_err", yaw_err)
+            self._add_metric("yaw_err", yaw_err)
         components = [item for item in (vx_err, vy_err, yaw_err) if item is not None]
         if components:
             vel_l1 = torch.stack(components, dim=-1).sum(dim=-1)
-            self.acc.add("vel_l1", vel_l1)
+            self._add_metric("vel_l1", vel_l1)
             self._append_history("vel_l1", vel_l1)
         return vx_err, vy_err, yaw_err, vel_l1
 
@@ -1029,7 +1139,7 @@ class CoordinationMetrics:
         if base_ang_vel is not None and self.prev_base_ang_vel is not None:
             base_ang_acc = (base_ang_vel - self.prev_base_ang_vel) / max(self.dt, 1.0e-9)
             base_ang_acc_norm = torch.linalg.norm(base_ang_acc, dim=-1)
-            self.acc.add("base_ang_acc", base_ang_acc_norm)
+            self._add_metric("base_ang_acc", base_ang_acc_norm)
             self._append_history("base_ang_acc", base_ang_acc_norm)
         elif base_ang_vel is None:
             self._skip_once("stability/base_ang_acc", "base angular velocity unavailable")
@@ -1037,7 +1147,7 @@ class CoordinationMetrics:
         if base_lin_vel is not None and self.prev_base_lin_vel is not None:
             base_lin_acc = (base_lin_vel - self.prev_base_lin_vel) / max(self.dt, 1.0e-9)
             base_lin_acc_norm = torch.linalg.norm(base_lin_acc, dim=-1)
-            self.acc.add("base_lin_acc", base_lin_acc_norm)
+            self._add_metric("base_lin_acc", base_lin_acc_norm)
             self._append_history("base_lin_acc", base_lin_acc_norm)
         elif base_lin_vel is None:
             self._skip_once("stability/base_lin_acc", "base linear velocity unavailable")
@@ -1052,8 +1162,8 @@ class CoordinationMetrics:
         err_vec = actual[:, :3] - target[:, :3]
         pos_err = torch.linalg.norm(err_vec, dim=-1)
         pos_l1 = torch.sum(torch.abs(err_vec), dim=-1)
-        self.acc.add("ee_pos_err", pos_err)
-        self.acc.add("ee_l1", pos_l1)
+        self._add_metric("ee_pos_err", pos_err)
+        self._add_metric("ee_l1", pos_l1)
         self._append_history("ee_pos_err", pos_err)
         return pos_err, pos_l1, target
 
@@ -1070,7 +1180,7 @@ class CoordinationMetrics:
         else:
             self._skip_once("ee/orientation", "orientation tensors are neither quaternion nor rpy")
             return None
-        self.acc.add("ee_ori_err", ori_err)
+        self._add_metric("ee_ori_err", ori_err)
         self._append_history("ee_ori_err", ori_err)
         return ori_err
 
@@ -1101,9 +1211,9 @@ class CoordinationMetrics:
         actual_sphere = _cart_to_sphere(local)
         sphere_err = torch.abs(actual_sphere - target_sphere[:, :3])
         sphere_err[:, 1:] = torch.abs(angle_wrap_error(actual_sphere[:, 1:], target_sphere[:, 1:3]))
-        self.acc.add("ee_sphere_l_err", sphere_err[:, 0])
-        self.acc.add("ee_sphere_p_err", sphere_err[:, 1])
-        self.acc.add("ee_sphere_y_err", sphere_err[:, 2])
+        self._add_metric("ee_sphere_l_err", sphere_err[:, 0])
+        self._add_metric("ee_sphere_p_err", sphere_err[:, 1])
+        self._add_metric("ee_sphere_y_err", sphere_err[:, 2])
 
     def _update_episode_metrics(
         self,
@@ -1111,15 +1221,15 @@ class CoordinationMetrics:
         alive_mask: torch.Tensor,
         reset_event: Optional[torch.Tensor],
     ) -> None:
-        self.current_episode_steps += 1
-        self.current_episode_alive &= alive_mask
+        self.current_episode_steps[self._active_mask] += 1
+        self.current_episode_alive[self._active_mask] &= alive_mask[self._active_mask]
         if success_mask is not None:
             first_success = success_mask & ~self.current_episode_success
             self.current_episode_success |= success_mask
             success_times = self.current_episode_steps.float() * self.dt
             self.time_to_success.append(success_times[first_success].detach())
 
-        if reset_event is None:
+        if self.sample_mode or reset_event is None:
             return
         finished = reset_event & (self.current_episode_steps > 0)
         self.episodes_finished += finished.float().sum()
@@ -1146,9 +1256,9 @@ class CoordinationMetrics:
         if leg_idx.numel() > 0:
             leg_power_values = explicit_power_abs.index_select(1, leg_idx)
             leg_power = leg_power_values.sum(dim=-1)
-            self.acc.add("leg_power_abs", leg_power)
-            self.acc.add("leg_power_squared", torch.square(leg_power_values).sum(dim=-1))
-            self.energy_sums["leg"] += leg_power.double().sum() * self.dt
+            self._add_metric("leg_power_abs", leg_power)
+            self._add_metric("leg_power_squared", torch.square(leg_power_values).sum(dim=-1))
+            self.energy_sums["leg"] += leg_power[self._active_mask].double().sum() * self.dt
         else:
             self._skip_once("energy/leg", "leg DOF indices unavailable")
 
@@ -1165,17 +1275,17 @@ class CoordinationMetrics:
                 arm_power_values = explicit_power_abs.index_select(1, arm_idx)
                 self.arm_energy_source = "explicit_force_torque"
             arm_power = arm_power_values.sum(dim=-1)
-            self.acc.add("arm_power_abs", arm_power)
-            self.acc.add("arm_power_squared", torch.square(arm_power_values).sum(dim=-1))
-            self.energy_sums["arm"] += arm_power.double().sum() * self.dt
+            self._add_metric("arm_power_abs", arm_power)
+            self._add_metric("arm_power_squared", torch.square(arm_power_values).sum(dim=-1))
+            self.energy_sums["arm"] += arm_power[self._active_mask].double().sum() * self.dt
         else:
             self._skip_once("energy/arm", "arm DOF indices unavailable")
 
         total_power = total_power_values.sum(dim=-1)
         total_power_sq = torch.square(total_power_values).sum(dim=-1)
-        self.acc.add("total_power_abs", total_power)
-        self.acc.add("total_power_squared", total_power_sq)
-        self.energy_sums["total"] += total_power.double().sum() * self.dt
+        self._add_metric("total_power_abs", total_power)
+        self._add_metric("total_power_squared", total_power_sq)
+        self.energy_sums["total"] += total_power[self._active_mask].double().sum() * self.dt
 
     def _position_drive_arm_power_values(
         self,
@@ -1421,12 +1531,25 @@ class CoordinationMetrics:
     def _append_history(self, name: str, value: Optional[torch.Tensor]) -> None:
         if value is None:
             return
+        if value.dim() > 0 and value.shape[0] == self.num_envs:
+            value = value[self._active_mask]
         self.history.setdefault(name, []).append(value.detach().clone())
 
     def _append_traj(self, name: str, value: Optional[torch.Tensor]) -> None:
         if not self.save_eval_traj or value is None:
             return
+        if value.dim() > 0 and value.shape[0] == self.num_envs:
+            value = value[self._active_mask]
         self.traj.setdefault(name, []).append(value.detach().clone())
+
+    def _add_metric(self, name: str, value: Optional[torch.Tensor]) -> None:
+        if value is None:
+            return
+        mask = None
+        if isinstance(value, torch.Tensor) and value.dim() > 0:
+            if value.shape[0] == self.num_envs:
+                mask = self._active_mask
+        self.acc.add(name, value, mask=mask)
 
     def _cache_previous(
         self,

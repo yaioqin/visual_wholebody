@@ -55,6 +55,15 @@ class ManipLoco(LeggedRobot):
     cfg: B1Z1RoughCfg
 
     def __init__(self, cfg, *args, **kwargs):
+        # Evaluation hooks are opt-in and initialized before BaseTask creates
+        # or resets any simulator buffers.  Training never enables them.
+        self.evaluation_command_override = False
+        self.evaluation_ee_override = False
+        self.evaluation_diagnostics_enabled = False
+        self.evaluation_step_state = None
+        self.evaluation_reward_terms = {}
+        self.evaluation_manip_log_eta_ref = None
+        self.evaluation_ma2b_consumed = None
         multi_agent_cfg = getattr(cfg, "multi_agent", None)
         command_cfg = getattr(cfg, "commands", None)
         pfg_cfg = getattr(getattr(cfg, "rewards", None), "pfg", None)
@@ -91,6 +100,12 @@ class ManipLoco(LeggedRobot):
             actions (torch.Tensor): Tensor of shape (num_envs, num_actions_per_env)
             前12维是底盘控制，后6维是机械臂控制
         """
+        if self.evaluation_diagnostics_enabled:
+            # This is the message present in the policy observation and later
+            # consumed by rewards during this control step.  compute_observations
+            # builds the next message only after compute_reward().
+            self.evaluation_ma2b_consumed = self.m_a2b.detach().clone()
+
         actions = actions.clone()
         if not self.use_policy_arm_delta_action:
             actions[:, 12:] = 0.
@@ -207,6 +222,8 @@ class ManipLoco(LeggedRobot):
         self.check_termination()
         self.compute_reward()
         self._update_low_level_log_diagnostics()
+        if self.evaluation_diagnostics_enabled:
+            self._capture_evaluation_step_state()
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         self.reset_idx(env_ids, start=False)
         self.compute_observations() # in some cases a simulation step might be required to refresh some obs (for example body positions)
@@ -357,11 +374,15 @@ class ManipLoco(LeggedRobot):
             Calls each reward function which had a non-zero scale (processed in self._prepare_reward_function())
             adds each terms to the episode sums and to the total reward
         """
+        if self.evaluation_diagnostics_enabled:
+            self.evaluation_reward_terms = {}
         self.rew_buf[:] = 0.
         for i in range(len(self.reward_functions)):
             name = self.reward_names[i]
             rew, metric = self.reward_functions[i]()
             rew = rew * self.reward_scales[name]
+            if self.evaluation_diagnostics_enabled:
+                self._cache_evaluation_reward_term(name, rew)
             self.rew_buf += rew
             self.episode_sums[name] += rew
             self.episode_metric_sums[name] += metric
@@ -371,6 +392,8 @@ class ManipLoco(LeggedRobot):
         if "termination" in self.reward_scales:
             rew, metric = self._reward_termination()
             rew = rew * self.reward_scales["termination"]
+            if self.evaluation_diagnostics_enabled:
+                self._cache_evaluation_reward_term("termination", rew)
             self.rew_buf += rew
             self.episode_sums["termination"] += rew
             self.episode_metric_sums["termination"] += metric
@@ -382,6 +405,8 @@ class ManipLoco(LeggedRobot):
             name = self.arm_reward_names[i]
             rew, metric = self.arm_reward_functions[i]()
             rew = rew * self.arm_reward_scales[name]
+            if self.evaluation_diagnostics_enabled:
+                self._cache_evaluation_reward_term(name, rew)
             self.arm_rew_buf += rew
             self.episode_sums[name] += rew
             self.episode_metric_sums[name] += metric
@@ -391,11 +416,24 @@ class ManipLoco(LeggedRobot):
         if "arm_termination" in self.arm_reward_scales:
             rew, metric = self._reward_termination()
             rew = rew * self.arm_reward_scales["arm_termination"]
+            if self.evaluation_diagnostics_enabled:
+                self._cache_evaluation_reward_term("arm_termination", rew)
             self.arm_rew_buf += rew
             self.episode_sums["arm_termination"] += rew
             self.episode_metric_sums["arm_termination"] += metric
 
         self.arm_rew_buf /= 100
+
+    def _cache_evaluation_reward_term(self, name, value):
+        value = torch.as_tensor(value, device=self.device, dtype=self.rew_buf.dtype)
+        if value.dim() == 0:
+            value = value.expand(self.num_envs)
+        if value.shape != (self.num_envs,):
+            raise ValueError(
+                f"Evaluation reward term {name} has shape {tuple(value.shape)}, "
+                f"expected {(self.num_envs,)}"
+            )
+        self.evaluation_reward_terms[name] = value.detach().clone() / 100.0
 
     def compute_observations(self):
         """ Computes observations
@@ -511,6 +549,409 @@ class ManipLoco(LeggedRobot):
             "torque_penalty": torch.mean(torch.sum(torch.square(self.torques), dim=1)),
             "action_rate_penalty": torch.mean(action_rate),
         }
+
+    @torch.no_grad()
+    def enable_evaluation_mode(
+        self,
+        *,
+        command_override=True,
+        ee_override=True,
+        diagnostics=True,
+    ):
+        """Enable play-only command ownership and numerical diagnostics.
+
+        This method is never called by the training runner.  In particular it
+        does not alter reward values, observations, action processing, or the
+        training samplers when the flags remain at their default ``False``.
+        """
+        self.evaluation_command_override = bool(command_override)
+        self.evaluation_ee_override = bool(ee_override)
+        self.evaluation_diagnostics_enabled = bool(diagnostics)
+        if diagnostics:
+            jacobian = self.get_arm_jacobian(refresh=True)
+            eps = float(getattr(self.cfg.rewards.manipulability, "eps", 1.0e-6))
+            log_eta = torch.sum(
+                torch.log(torch.clamp(torch.linalg.svdvals(jacobian), min=eps)),
+                dim=-1,
+            )
+            self.evaluation_manip_log_eta_ref = torch.median(log_eta.detach()).clone()
+            self.evaluation_ma2b_consumed = self.m_a2b.detach().clone()
+
+    @torch.no_grad()
+    def disable_evaluation_mode(self):
+        self.evaluation_command_override = False
+        self.evaluation_ee_override = False
+        self.evaluation_diagnostics_enabled = False
+        self.evaluation_step_state = None
+
+    @torch.no_grad()
+    def set_evaluation_commands(self, commands, env_ids=None):
+        """Assign exact base commands without curriculum or small-command clipping."""
+        if not self.evaluation_command_override:
+            raise RuntimeError("Evaluation command override is not enabled")
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        commands = torch.as_tensor(commands, device=self.device, dtype=self.commands.dtype)
+        if commands.shape != (len(env_ids), self.command_obs_dim):
+            raise ValueError(
+                f"Expected evaluation commands {(len(env_ids), self.command_obs_dim)}, "
+                f"got {tuple(commands.shape)}"
+            )
+
+        range_by_index = [(0, "lin_vel_x"), (2, "ang_vel_yaw")]
+        if self.use_5d_base_command:
+            range_by_index = [
+                (0, "lin_vel_x"),
+                (1, "lin_vel_y"),
+                (2, "ang_vel_yaw"),
+                (3, "base_pitch"),
+                (4, "base_height"),
+            ]
+        for index, name in range_by_index:
+            low, high = self.command_ranges[name]
+            value = commands[:, index]
+            if torch.any((value < low) | (value > high)):
+                raise ValueError(f"Evaluation command {name} is outside [{low}, {high}]")
+        if not self.use_5d_base_command and torch.any(commands[:, 1] != 0):
+            raise ValueError("3D command mode requires the disabled lin_vel_y slot to remain zero")
+        self.commands[env_ids] = commands
+
+    @torch.no_grad()
+    def set_evaluation_ee_goals(
+        self,
+        ee_commands,
+        env_ids=None,
+        *,
+        transition_steps=50,
+        total_steps=250,
+    ):
+        """Validate and assign scheduled [sphere position, delta RPY] targets.
+
+        Returns a pair ``(valid_mask, rejection_codes)``.  Rejection codes are
+        0=valid, 1=outside configured range, 2=collision box, 3=underground.
+        Invalid targets are not written to the active environment state.
+        """
+        if not self.evaluation_ee_override:
+            raise RuntimeError("Evaluation EE override is not enabled")
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        ee_commands = torch.as_tensor(
+            ee_commands, device=self.device, dtype=self.ee_goal_sphere.dtype
+        )
+        if ee_commands.shape != (len(env_ids), 6):
+            raise ValueError(
+                f"Expected EE commands {(len(env_ids), 6)}, got {tuple(ee_commands.shape)}"
+            )
+
+        names = (
+            "pos_l", "pos_p", "pos_y",
+            "delta_orn_r", "delta_orn_p", "delta_orn_y",
+        )
+        in_range = torch.ones(len(env_ids), device=self.device, dtype=torch.bool)
+        for index, name in enumerate(names):
+            low, high = self.goal_ee_ranges[name]
+            in_range &= (ee_commands[:, index] >= low) & (ee_commands[:, index] <= high)
+
+        start = self.curr_ee_goal_sphere[env_ids]
+        interpolation = torch.linspace(
+            0.0, 1.0, self.num_collision_check_samples,
+            device=self.device, dtype=ee_commands.dtype,
+        )
+        sphere_path = torch.lerp(
+            start[:, None, :],
+            ee_commands[:, None, :3],
+            interpolation[None, :, None],
+        )
+        cart_path = sphere2cart(sphere_path.reshape(-1, 3)).reshape(
+            len(env_ids), self.num_collision_check_samples, 3
+        )
+        collision = torch.any(
+            torch.all(cart_path < self.collision_upper_limits, dim=-1)
+            & torch.all(cart_path > self.collision_lower_limits, dim=-1),
+            dim=1,
+        )
+        underground = torch.any(cart_path[..., 2] < self.underground_limit, dim=1)
+        valid = in_range & ~collision & ~underground
+        rejection_codes = torch.zeros(len(env_ids), device=self.device, dtype=torch.long)
+        rejection_codes[~in_range] = 1
+        rejection_codes[in_range & collision] = 2
+        rejection_codes[in_range & ~collision & underground] = 3
+
+        valid_env_ids = env_ids[valid]
+        if valid_env_ids.numel() > 0:
+            valid_commands = ee_commands[valid]
+            self.ee_start_sphere[valid_env_ids] = start[valid]
+            self.ee_goal_sphere[valid_env_ids] = valid_commands[:, :3]
+            self.ee_goal_cart[valid_env_ids] = sphere2cart(valid_commands[:, :3])
+            self.ee_goal_orn_delta_rpy[valid_env_ids] = valid_commands[:, 3:]
+            self.goal_timer[valid_env_ids] = 0.0
+            self.traj_timesteps[valid_env_ids] = max(1, int(transition_steps))
+            self.traj_total_timesteps[valid_env_ids] = max(
+                int(total_steps) + 1, int(transition_steps) + 1
+            )
+        return valid, rejection_codes
+
+    @torch.no_grad()
+    def _capture_evaluation_step_state(self):
+        """Capture post-physics, pre-reset state for Stage-A GPU logging."""
+        jacobian = self.get_arm_jacobian(refresh=False)
+        eps = float(getattr(self.cfg.rewards.manipulability, "eps", 1.0e-6))
+        singular_values = torch.linalg.svdvals(jacobian)
+        log_eta = torch.sum(torch.log(torch.clamp(singular_values, min=eps)), dim=-1)
+        eta_raw = torch.prod(torch.clamp(singular_values, min=eps), dim=-1)
+        reference = getattr(self, "manip_log_eta_ref", None)
+        if reference is None:
+            reference = self.evaluation_manip_log_eta_ref
+        if reference is None:
+            reference = torch.median(log_eta.detach()).clone()
+        reference_batch = torch.ones_like(log_eta) * reference
+        min_log_ratio = float(
+            getattr(self.cfg.rewards.manipulability, "min_log_ratio", -20.0)
+        )
+        eta_ratio = torch.exp(
+            torch.clamp(log_eta - reference_batch, min=min_log_ratio, max=0.0)
+        )
+
+        ee_delta = self.curr_ee_goal_cart_world - self.ee_pos
+        current_chunk = torch.zeros(
+            self.num_envs, 1, 6, device=self.device, dtype=ee_delta.dtype
+        )
+        current_chunk[:, 0, :3] = ee_delta
+        current_ma2b = MultiAgentMessageBuilder.compute_m_a2b(current_chunk, jacobian)
+        consumed_ma2b = self.evaluation_ma2b_consumed
+        if consumed_ma2b is None:
+            consumed_ma2b = self.m_a2b
+
+        from legged_gym.utils.hard_case_mining import directional_manipulability_xy
+        directional, directional_valid = directional_manipulability_xy(
+            jacobian, current_ma2b[:, :3]
+        )
+        desired_xy = current_ma2b[:, :2]
+        direction_xy = desired_xy / torch.clamp(
+            torch.linalg.norm(desired_xy, dim=-1, keepdim=True), min=1.0e-6
+        )
+        assist_alignment = torch.sum(self.base_lin_vel[:, :2] * direction_xy, dim=-1)
+
+        base_rpy = self._get_body_orientation(return_yaw=True)
+        ee_pos_error = torch.linalg.norm(ee_delta, dim=-1)
+        ee_orientation_error = torch.linalg.norm(
+            orientation_error(
+                self.ee_goal_orn_quat,
+                self.ee_orn / torch.clamp(torch.norm(self.ee_orn, dim=-1, keepdim=True), min=1.0e-8),
+            ),
+            dim=-1,
+        )
+        fall = self.reset_buf.bool() & ~self.time_out_buf.bool()
+        collision = torch.any(
+            torch.norm(self.contact_forces[:, self.penalized_contact_indices], dim=-1) > 1.0,
+            dim=1,
+        )
+        termination_reason = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        termination_reason[fall] = 1
+        termination_reason[self.time_out_buf.bool()] = 2
+        termination_reason[collision & self.reset_buf.bool()] = 3
+
+        arm_actions = self.actions.index_select(1, self.arm_action_indices)
+        arm_pos_targets = self.arm_pos_targets
+        reward_low_manip = self.evaluation_reward_terms.get(
+            "low_manipulability", torch.zeros_like(self.rew_buf)
+        )
+        reward_assist = self.evaluation_reward_terms.get(
+            "arm_base_assist", torch.zeros_like(self.rew_buf)
+        )
+
+        ee_local_yaw = quat_rotate_inverse(
+            self.base_yaw_quat,
+            self.ee_pos - self._get_ee_goal_spherical_center(),
+        )
+        ee_radius = torch.linalg.norm(ee_local_yaw, dim=-1).clamp_min(1.0e-9)
+        actual_ee_sphere = torch.stack(
+            (
+                ee_radius,
+                torch.atan2(
+                    ee_local_yaw[:, 2],
+                    torch.linalg.norm(ee_local_yaw[:, :2], dim=-1).clamp_min(1.0e-9),
+                ),
+                torch.atan2(ee_local_yaw[:, 1], ee_local_yaw[:, 0]),
+            ),
+            dim=-1,
+        )
+        pfg_success = (
+            self.pfg_ik_success
+            if isinstance(self.pfg_ik_success, torch.Tensor)
+            else torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        )
+        pfg_position_error = (
+            self.pfg_position_error
+            if isinstance(self.pfg_position_error, torch.Tensor)
+            else torch.full_like(self.rew_buf, float("nan"))
+        )
+        pfg_rotation_error = (
+            self.pfg_rotation_error
+            if isinstance(self.pfg_rotation_error, torch.Tensor)
+            else torch.full_like(self.rew_buf, float("nan"))
+        )
+
+        state = {
+            "episode_step": self.episode_length_buf,
+            "base_pos": self.base_pos,
+            "base_quat": self.base_quat,
+            "base_rpy": base_rpy,
+            "base_lin_vel": self.base_lin_vel,
+            "base_ang_vel": self.base_ang_vel,
+            "base_command": self.commands,
+            "arm_dof_pos": self.dof_pos.index_select(1, self.arm_dof_indices_tensor),
+            "arm_dof_vel": self.dof_vel.index_select(1, self.arm_dof_indices_tensor),
+            "arm_action": arm_actions,
+            "arm_pos_target": arm_pos_targets,
+            "ee_pos": self.ee_pos,
+            "ee_quat": self.ee_orn,
+            "ee_target_pos": self.curr_ee_goal_cart_world,
+            "ee_target_quat": self.ee_goal_orn_quat,
+            "ee_target_sphere": self.curr_ee_goal_sphere,
+            "achieved_ee_sphere": actual_ee_sphere,
+            "ee_pos_error": ee_pos_error,
+            "ee_orientation_error": ee_orientation_error,
+            "ma2b_delta_p_bar_xyz_current": current_ma2b[:, :3],
+            "ma2b_ee_request_amplitude_current": current_ma2b[:, 3],
+            "ma2b_eta_raw_current": current_ma2b[:, 4],
+            "ma2b_consumed": consumed_ma2b,
+            "ma2b_delta_p_bar_xyz_consumed": consumed_ma2b[:, :3],
+            "ma2b_ee_request_amplitude_consumed": consumed_ma2b[:, 3],
+            "ma2b_eta_raw_consumed": consumed_ma2b[:, 4],
+            "eta_raw": eta_raw,
+            "manip_log_eta": log_eta,
+            "manip_log_eta_ref": reference_batch,
+            "eta_ratio": eta_ratio,
+            "directional_manipulability_xy": directional,
+            "directional_manipulability_valid": directional_valid,
+            "base_assist_alignment_raw": assist_alignment,
+            "base_assist_alignment_positive": torch.clamp(assist_alignment, min=0.0),
+            "reward_total": self.rew_buf + self.arm_rew_buf,
+            "reward_low_manipulability": reward_low_manip,
+            "reward_arm_base_assist": reward_assist,
+            "fall": fall,
+            "collision": collision,
+            "timeout": self.time_out_buf,
+            "done": self.reset_buf.bool(),
+            "termination_reason_code": termination_reason,
+            "pfg_ik_success": pfg_success,
+            "pfg_position_error": pfg_position_error,
+            "pfg_rotation_error": pfg_rotation_error,
+        }
+        # reset_idx mutates many source tensors immediately after this method;
+        # keep the diagnostic snapshot on GPU until play consumes it.
+        self.evaluation_step_state = {
+            name: value.detach().clone() for name, value in state.items()
+        }
+
+    @torch.no_grad()
+    def get_evaluation_snapshot_state(self):
+        """Return Python-visible state needed for state-matched candidate replay."""
+        fields = {
+            "_root_states": self._root_states,
+            "dof_pos": self.dof_pos,
+            "dof_vel": self.dof_vel,
+            "commands": self.commands,
+            "ee_start_sphere": self.ee_start_sphere,
+            "ee_goal_sphere": self.ee_goal_sphere,
+            "curr_ee_goal_sphere": self.curr_ee_goal_sphere,
+            "ee_goal_cart": self.ee_goal_cart,
+            "curr_ee_goal_cart": self.curr_ee_goal_cart,
+            "curr_ee_goal_cart_world": self.curr_ee_goal_cart_world,
+            "ee_goal_orn_delta_rpy": self.ee_goal_orn_delta_rpy,
+            "ee_goal_orn_quat": self.ee_goal_orn_quat,
+            "goal_timer": self.goal_timer,
+            "traj_timesteps": self.traj_timesteps,
+            "traj_total_timesteps": self.traj_total_timesteps,
+            "episode_length_buf": self.episode_length_buf,
+            "last_actions": self.last_actions,
+            "actions": self.actions,
+            "action_history_buf": self.action_history_buf,
+            "obs_history_buf": self.obs_history_buf,
+            "obs_buf": self.obs_buf,
+            "last_dof_vel": self.last_dof_vel,
+            "last_root_vel": self.last_root_vel,
+            "last_torques": self.last_torques,
+            "torques": self.torques,
+            "last_contacts": self.last_contacts,
+            "feet_air_time": self.feet_air_time,
+            "desired_contact_states": self.desired_contact_states,
+            "gait_indices": self.gait_indices,
+            "clock_inputs": self.clock_inputs,
+            "doubletime_clock_inputs": self.doubletime_clock_inputs,
+            "halftime_clock_inputs": self.halftime_clock_inputs,
+            "all_pos_targets": self.all_pos_targets,
+            "arm_pos_targets": self.arm_pos_targets,
+            "prev_arm_action_chunk": self.prev_arm_action_chunk,
+            "m_a2b": self.m_a2b,
+            "m_a2g": self.m_a2g,
+            "motor_strength": self.motor_strength,
+            "mass_params_tensor": self.mass_params_tensor,
+            "friction_coeffs_tensor": self.friction_coeffs_tensor,
+        }
+        for optional_name in (
+            "pfg_q_ideal", "pfg_ik_success", "pfg_ik_energy",
+            "pfg_position_error", "pfg_rotation_error",
+        ):
+            value = getattr(self, optional_name, None)
+            if isinstance(value, torch.Tensor):
+                fields[optional_name] = value
+        fields["global_steps"] = torch.full(
+            (self.num_envs,), int(self.global_steps), device=self.device, dtype=torch.long
+        )
+        fields["common_step_counter"] = torch.full(
+            (self.num_envs,), int(self.common_step_counter), device=self.device, dtype=torch.long
+        )
+        return fields
+
+    @torch.no_grad()
+    def restore_evaluation_snapshot(self, snapshot_state, env_id=0):
+        """Restore one saved source env into ``env_id`` of this simulator."""
+        env_id = int(env_id)
+        if not (0 <= env_id < self.num_envs):
+            raise ValueError(f"env_id {env_id} is outside [0, {self.num_envs})")
+        state = snapshot_state.get("state", snapshot_state)
+        for name, source in state.items():
+            if name in ("global_steps", "common_step_counter"):
+                setattr(self, name, int(torch.as_tensor(source).item()))
+                continue
+            target = getattr(self, name, None)
+            if not isinstance(target, torch.Tensor):
+                continue
+            source = torch.as_tensor(source, device=self.device, dtype=target.dtype)
+            if target.shape[0] != self.num_envs or source.shape != target.shape[1:]:
+                raise ValueError(
+                    f"Snapshot field {name} shape {tuple(source.shape)} is incompatible "
+                    f"with target {tuple(target.shape)}"
+                )
+            target[env_id].copy_(source)
+
+        self.gym.set_actor_root_state_tensor(
+            self.sim, gymtorch.unwrap_tensor(self._root_states)
+        )
+        self.gym.set_dof_state_tensor(self.sim, gymtorch.unwrap_tensor(self.dof_state))
+        self.gym.refresh_actor_root_state_tensor(self.sim)
+        self.gym.refresh_dof_state_tensor(self.sim)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
+        self.gym.refresh_jacobian_tensors(self.sim)
+        self.base_quat[:] = self.root_states[:, 3:7]
+        self.base_lin_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
+        self.base_ang_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
+        self.projected_gravity[:] = quat_rotate_inverse(self.base_quat, self.gravity_vec)
+        base_yaw = euler_from_quat(self.base_quat)[2]
+        self.base_yaw_quat[:] = quat_from_euler_xyz(
+            torch.zeros_like(base_yaw), torch.zeros_like(base_yaw), base_yaw
+        )
+        self.base_yaw_euler[:] = torch.stack(
+            (torch.zeros_like(base_yaw), torch.zeros_like(base_yaw), base_yaw),
+            dim=-1,
+        )
+        self.reset_buf[env_id] = 0
+        self.time_out_buf[env_id] = False
+        return self.obs_buf[env_id:env_id + 1]
 
     def create_sim(self):
         """ Creates simulation, terrain and evironments
@@ -868,13 +1309,19 @@ class ManipLoco(LeggedRobot):
             camera_props = gymapi.CameraProperties()
             camera_props.width = 720
             camera_props.height = 480
-            self._rendering_camera_handles = []
-            for i in range(self.num_envs):
+            requested_ids = getattr(self.cfg.env, "record_video_env_ids", [0])
+            self._record_video_env_ids = sorted(
+                {int(i) for i in requested_ids if 0 <= int(i) < self.num_envs}
+            )
+            if not self._record_video_env_ids:
+                raise ValueError("record_video_env_ids does not contain a valid environment")
+            self._rendering_camera_handles = {}
+            for i in self._record_video_env_ids:
                 # root_pos = self.root_states[i, :3].cpu().numpy()
                 # cam_pos = root_pos + np.array([0, 1, 0.5])
                 cam_pos = np.array([0, 1, 0.5])
                 camera_handle = self.gym.create_camera_sensor(self.envs[i], camera_props)
-                self._rendering_camera_handles.append(camera_handle)
+                self._rendering_camera_handles[i] = camera_handle
                 self.gym.set_camera_location(camera_handle, self.envs[i], gymapi.Vec3(*cam_pos), gymapi.Vec3(*0*cam_pos))
 
     def _debug_print_kinematics_names(self, env_handle, actor_handle):
@@ -1233,6 +1680,8 @@ class ManipLoco(LeggedRobot):
         commands[:, 2] = 期望 yaw 角速度
         """
 
+        if self.evaluation_command_override:
+            return
         if self.cfg.env.teleop_mode:
             return
 
@@ -1433,16 +1882,31 @@ class ManipLoco(LeggedRobot):
         return clipped
 
     def get_arm_jacobian(self, refresh=True):
-        """
-        Returns:
-            J_arm: Tensor[num_envs, 6, 6]
-        """
         if refresh:
             self.gym.refresh_jacobian_tensors(self.sim)
-        j_ee = self.jacobian_whole[:, self.ee_body_idx, :6, :]
-        j_arm = j_ee.index_select(-1, self.arm_dof_indices_tensor)
-        assert j_arm.shape == (self.num_envs, 6, 6), j_arm.shape
+
+        jacobian = self.jacobian_whole
+
+        if jacobian.shape[-1] == self.num_dofs + 6:
+            # Floating base
+            body_idx = self.ee_body_idx
+            dof_indices = self.arm_dof_indices_tensor + 6
+        elif jacobian.shape[-1] == self.num_dofs:
+            # Fixed base: root body does not have a Jacobian row
+            body_idx = self.ee_body_idx - 1
+            dof_indices = self.arm_dof_indices_tensor
+        else:
+            raise RuntimeError(
+                f"Unexpected Jacobian shape {tuple(jacobian.shape)}, "
+                f"num_dofs={self.num_dofs}"
+            )
+
+        j_arm = jacobian[:, body_idx, :, :].index_select(-1, dof_indices)
+
+        expected_shape = (self.num_envs, 6, 6)
+        assert j_arm.shape == expected_shape, j_arm.shape
         assert torch.isfinite(j_arm).all()
+
         self.ee_j_eef = j_arm
         return j_arm
 
@@ -1605,6 +2069,18 @@ class ManipLoco(LeggedRobot):
         self.ee_goal_orn_delta_rpy[env_ids, :] = torch.cat([ee_goal_delta_orn_r, ee_goal_delta_orn_p, ee_goal_delta_orn_y], dim=-1)
 
     def _resample_ee_goal(self, env_ids, is_init=False):
+        if self.evaluation_ee_override:
+            if is_init and len(env_ids) > 0:
+                # Every coverage sample starts from the same configured initial
+                # EE command; the scheduler then assigns the target explicitly.
+                self.ee_goal_orn_delta_rpy[env_ids] = 0.0
+                self.ee_start_sphere[env_ids] = self.init_start_ee_sphere
+                self.ee_goal_sphere[env_ids] = self.init_start_ee_sphere
+                self.curr_ee_goal_sphere[env_ids] = self.init_start_ee_sphere
+                self.ee_goal_cart[env_ids] = sphere2cart(self.ee_goal_sphere[env_ids])
+                self.curr_ee_goal_cart[env_ids] = self.ee_goal_cart[env_ids]
+                self.goal_timer[env_ids] = 0.0
+            return
         if self.cfg.env.teleop_mode and is_init:
             self.curr_ee_goal_sphere[:] = self.init_start_ee_sphere[:]
             return
@@ -1683,17 +2159,18 @@ class ManipLoco(LeggedRobot):
     def render_record(self, mode="rgb_array"):
         if self.global_steps % 2 == 0:
             self.gym.step_graphics(self.sim)
-            self.gym.render_all_camera_sensors(self.sim)
-            imgs = []
-            for i in range(self.num_envs):
+            for i in self._record_video_env_ids:
                 cam = self._rendering_camera_handles[i]
                 root_pos = self.root_states[i, :3].cpu().numpy()
                 cam_pos = root_pos + np.array([0, 2, 1])
                 self.gym.set_camera_location(cam, self.envs[i], gymapi.Vec3(*cam_pos), gymapi.Vec3(*root_pos))
-                
+            self.gym.render_all_camera_sensors(self.sim)
+            imgs = {}
+            for i in self._record_video_env_ids:
+                cam = self._rendering_camera_handles[i]
                 img = self.gym.get_camera_image(self.sim, self.envs[i], cam, gymapi.IMAGE_COLOR)
                 w, h = img.shape
-                imgs.append(img.reshape([w, h // 4, 4]))
+                imgs[i] = img.reshape([w, h // 4, 4])
             return imgs
         return None
 
