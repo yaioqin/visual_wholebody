@@ -6,15 +6,17 @@ import numpy as np
 class B2Z1RoughCfg(B1Z1RoughCfg):
     class goal_ee(B1Z1RoughCfg.goal_ee):
         class sphere_center(B1Z1RoughCfg.goal_ee.sphere_center):
-            x_offset = 0.2
+            x_offset = 0.3
             z_invariant_offset = 0.8
 
         class ranges(B1Z1RoughCfg.goal_ee.ranges):
             pos_l = [0.45, 0.95]
+            pos_p = [-0.80, 0.80]
             pos_y = [-0.75, 0.75]
 
     class env(B1Z1RoughCfg.env):
-        num_gripper_joints = 0
+        # The gripper is servoed separately from the 18 policy actions.
+        num_gripper_joints = 1
 
     class init_state(B1Z1RoughCfg.init_state):
         pos = [0.0, 0.0, 0.55]
@@ -35,12 +37,14 @@ class B2Z1RoughCfg(B1Z1RoughCfg):
             "RR_thigh_joint": 1.0,
             "RR_calf_joint": -1.5,
 
+            # Match the B1-Z1 arm's default pose (waist through wrist_rotate).
             "joint1": 0.0,
-            "joint2": 0.0,
-            "joint3": 0.0,
-            "joint4": 0.0,
+            "joint2": 1.48,
+            "joint3": -0.63,
+            "joint4": -0.84,
             "joint5": 0.0,
-            "joint6": 0.0,
+            "joint6": 1.57,
+            "z1_jointGripper": -0.785,
         }
 
     class control(B1Z1RoughCfg.control):
@@ -68,13 +72,16 @@ class B2Z1RoughCfg(B1Z1RoughCfg):
         file = '{LEGGED_GYM_ROOT_DIR}/resources/robots/b2_z1_lidar_mount_fast/urdf/b2_z1_lidar_mount_fast.urdf'
         base_name = "base_link"
         foot_name = "foot"
-        gripper_name = "gripperMover"
+        gripper_name = "ee_gripper_link"
         self_collisions = 0 # 1 to disable, 0 to enable...bitwise filter
         penalize_contacts_on = ["thigh", "base_link", "calf"]
         collapse_fixed_joints = False
 
     class arm(B1Z1RoughCfg.arm):
         base_offset = [0.34218, 0.0, 0.23851]
+        # ee_gripper_link already marks the B1-Z1 grasp point on the stator.
+        grasp_offset = 0.0
+        use_grasp_point_for_ee = False
 
     class rewards(B1Z1RoughCfg.rewards):
         base_height_target = 0.55
@@ -89,7 +96,7 @@ class B2Z1RoughCfg(B1Z1RoughCfg):
             tracking_lin_vel_max = 2.5
             tracking_ang_vel = 0.5
             torques = -1.0e-5
-            collision = -1.0
+            # collision = -1.0
 
 class B2Z1RoughCfgPPO(B1Z1RoughCfgPPO):
     class policy(B1Z1RoughCfgPPO.policy):
@@ -140,12 +147,8 @@ class B2Z1ReachableWorkspaceCfg(B2Z1BoundedActionsCfg):
 
         class ranges(B2Z1BoundedActionsCfg.goal_ee.ranges):
             pos_l = [0.45, 0.82]
-            pos_p = [-1.00, 0.80]
+            pos_p = [-0.80, 0.80]
             pos_y = [-0.90, 0.90]
-
-    class arm(B2Z1BoundedActionsCfg.arm):
-        grasp_offset = 0.086
-        use_grasp_point_for_ee = True
 
     class rewards(B2Z1BoundedActionsCfg.rewards):
         class scales(B2Z1BoundedActionsCfg.rewards.scales):
@@ -182,6 +185,7 @@ class B2Z1ReachableWorkspaceMotionCfg(B2Z1ReachableWorkspaceCfg):
         class ranges(B2Z1ReachableWorkspaceCfg.goal_ee.ranges):
             pos_l = [0.4, 0.95]
             pos_p = [-1 * np.pi / 2.5, 1 * np.pi / 3]
+            # pos_p = [-1 * np.pi / 1, 1 * np.pi / 3]
             pos_y = [-1.2, 1.2]
 
     class rewards(B2Z1ReachableWorkspaceCfg.rewards):
@@ -267,10 +271,6 @@ class B2Z1ReachableBalancedCfg(B2Z1ReachableWorkspaceCfg):
         class ranges(B2Z1AggressiveLocomotionCfg.goal_ee.ranges):
             pos_l = [0.45, 0.95]
             pos_y = [-0.75, 0.75]
-
-    class arm(B2Z1ReachableWorkspaceCfg.arm):
-        grasp_offset = 0.086
-        use_grasp_point_for_ee = True
 
     class rewards(B2Z1ReachableWorkspaceCfg.rewards):
         class scales(B2Z1ReachableWorkspaceCfg.rewards.scales):

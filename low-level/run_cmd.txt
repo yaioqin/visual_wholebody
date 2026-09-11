@@ -54,7 +54,7 @@ python play.py --exptid MARL_b2_z1_5D_base_command --task b2z1 --proj_name b2z1-
 
 
 python play.py --exptid b2_z1 --task b2z1 --proj_name b2z1-low --checkpoint 28000 --observe_gait_commands --sim_device cuda:0 --rl_device cuda:0  --record_video
-python play.py --exptid b2_z1 --task b2z1 --proj_name b2z1-low --checkpoint 28000 --observe_gait_commands --sim_device cuda:0 --rl_device cuda:0  
+python play.py --exptid b2_z1 --task b2z1 --proj_name b2z1-low --checkpoint 44000 --observe_gait_commands --sim_device cuda:0 --rl_device cuda:0  
 python train.py --headless --exptid b2_z1 --proj_name b2z1-low --task b2z1 --sim_device cuda:0 --rl_device cuda:0 --observe_gait_commands 
 
 python play.py --exptid b2_z1 --task b2z1 --proj_name b2z1-low --checkpoint 44000 --observe_gait_commands --sim_device cuda:0 --rl_device cuda:0   --record_video
@@ -66,6 +66,11 @@ low-level/legged_gym/scripts/visualize_b2_z1_urdf.py 可视化b2_z1脚本
 pip uninstall skrl rsl_rl  legged_gym  isaacgym 
 
 python visualize_b2_z1_urdf.py \
-  --asset-file /home/ubuntu22/E/visual_wholebody/low-level/resources/robots/b2_z1_lidar_mount/urdf/b2_z1_lidar_mount.urdf \
+  --asset-file /home/ubuntu22/E/visual_wholebody/low-level/resources/robots/b1z1/urdf/b1z1.urdf\
+  --fix-base \
+  --sim-device cuda:0
+
+python visualize_b2_z1_urdf.py \
+  --asset-file ../../resources/robots/b2_z1_lidar_mount_fast/urdf/b2_z1_lidar_mount_fast.urdf \
   --fix-base \
   --sim-device cuda:0

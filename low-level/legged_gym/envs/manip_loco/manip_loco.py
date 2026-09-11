@@ -138,7 +138,9 @@ class ManipLoco(LeggedRobot):
         dpose = torch.cat([dpos, drot], -1).unsqueeze(-1)
         arm_dof_slice = self._arm_dof_slice()
         arm_pos_targets = self._control_ik(dpose) + self.dof_pos[:, arm_dof_slice]
-        all_pos_targets = torch.zeros_like(self.dof_pos)
+        # Hold uncommanded joints (including the gripper) at their default pose.
+        # A zero target would close the gripper immediately after every reset.
+        all_pos_targets = self.default_dof_pos.expand_as(self.dof_pos).clone()
         all_pos_targets[:, arm_dof_slice] = arm_pos_targets
 
         for t in range(self.cfg.control.decimation):

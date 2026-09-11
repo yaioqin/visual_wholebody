@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Standalone B2-Z1 asset viewer.
+"""Standalone B1-Z1/B2-Z1 asset viewer.
 
 This viewer defaults to the local Isaac Gym URDF.  --asset-file can also point
 at an MJCF/XML file because Isaac Gym loads both formats through gym.load_asset().
+The loaded arm joint names select the robot's pose, links and EE-goal config.
 """
 
 import argparse
@@ -18,29 +19,8 @@ import numpy as np
 from isaacgym import gymapi, gymutil
 
 from legged_gym import LEGGED_GYM_ROOT_DIR
+from legged_gym.envs.manip_loco.b1z1_config import B1Z1RoughCfg
 from legged_gym.envs.manip_loco.b2z1_config import B2Z1RoughCfg
-
-
-B2_Z1_DEFAULT_JOINTS = {
-    "FL_hip_joint": 0.1,
-    "FL_thigh_joint": 0.8,
-    "FL_calf_joint": -1.5,
-    "FR_hip_joint": -0.1,
-    "FR_thigh_joint": 0.8,
-    "FR_calf_joint": -1.5,
-    "RL_hip_joint": 0.1,
-    "RL_thigh_joint": 1.0,
-    "RL_calf_joint": -1.5,
-    "RR_hip_joint": -0.1,
-    "RR_thigh_joint": 1.0,
-    "RR_calf_joint": -1.5,
-    "joint1": 0.0,
-    "joint2": 0.0,
-    "joint3": 0.0,
-    "joint4": 0.0,
-    "joint5": 0.0,
-    "joint6": 0.0,
-}
 
 
 ARM_GAINS = {
@@ -52,9 +32,16 @@ ARM_GAINS = {
     "joint6": (20.0, 1.0),
 }
 ARM_JOINT_NAMES = tuple(ARM_GAINS)
+B1_Z1_ARM_JOINT_NAMES = (
+    "z1_waist",
+    "z1_shoulder",
+    "z1_elbow",
+    "z1_wrist_angle",
+    "z1_forearm_roll",
+    "z1_wrist_rotate",
+)
 IK_ARM_SEED = {
-    # The all-zero training pose is singular for Cartesian IK. These values are
-    # the repository's standard non-singular Z1 arm pose from B1Z1RoughCfg.
+    # Use the repository's standard non-singular Z1 arm pose for Cartesian IK.
     "joint1": 0.0,
     "joint2": 1.48,
     "joint3": -0.63,
@@ -98,12 +85,15 @@ class LineSetGeometry(gymutil.LineGeometry):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Visualize the B2-Z1 URDF/MJCF asset in Isaac Gym."
+        description="Visualize a B1-Z1 or B2-Z1 URDF/MJCF asset in Isaac Gym."
     )
     parser.add_argument(
         "--asset-file",
-        default="{LEGGED_GYM_ROOT_DIR}/resources/robots/b2_z1/urdf/b2_z1.urdf",
-        help="URDF or MJCF/XML file to load. Defaults to the local B2-Z1 URDF.",
+        default=B2Z1RoughCfg.asset.file,
+        help=(
+            "URDF or MJCF/XML file to load. Defaults to the B2-Z1 training asset. "
+            "B1-Z1/B2-Z1 configuration is detected from the arm joint names."
+        ),
     )
     parser.add_argument(
         "--sim-device",
@@ -177,7 +167,7 @@ def parse_args():
         "--hide_ee_range",
         dest="show_ee_range",
         action="store_false",
-        help="Hide the b2z1 training EE-goal sampling range.",
+        help="Hide the selected robot's training EE-goal sampling range.",
     )
     parser.add_argument(
         "--ee-samples",
@@ -207,6 +197,20 @@ def resolve_asset_path(asset_file):
     if not path.exists():
         raise FileNotFoundError(f"Asset file does not exist: {path}")
     return path
+
+
+def detect_robot_config(dof_names):
+    """Select the robot by its joints, independent of the asset filename."""
+    names = set(dof_names)
+    if set(B1_Z1_ARM_JOINT_NAMES).issubset(names):
+        return "b1z1", B1Z1RoughCfg, B1_Z1_ARM_JOINT_NAMES
+    if set(ARM_JOINT_NAMES).issubset(names):
+        return "b2z1", B2Z1RoughCfg, ARM_JOINT_NAMES
+    raise ValueError(
+        "Unsupported arm joints: expected B1-Z1 joints "
+        f"{B1_Z1_ARM_JOINT_NAMES} or B2-Z1 joints {ARM_JOINT_NAMES}; "
+        f"loaded DOFs: {list(dof_names)}"
+    )
 
 
 def make_collision_visual_urdf(asset_path):
@@ -292,7 +296,7 @@ def sphere_to_cartesian(sphere_coords):
 
 
 def sample_training_ee_goals(goal_cfg, num_samples, seed=0):
-    """Reproduce b2z1 EE sampling, including trajectory collision checks."""
+    """Reproduce training EE sampling, including trajectory collision checks."""
     if num_samples < 0:
         raise ValueError("--ee-samples must be non-negative")
 
@@ -515,7 +519,7 @@ def cartesian_to_sphere(cart_coords):
 
 
 def clamp_ee_goal_sphere(goal_cfg, sphere_goal, previous_goal=None):
-    """Clamp an interactive goal to b2z1's r/p/y and static filters."""
+    """Clamp an interactive goal to the robot's r/p/y and static filters."""
     ranges = goal_cfg.ranges
     lower = np.array([ranges.pos_l[0], ranges.pos_p[0], ranges.pos_y[0]])
     upper = np.array([ranges.pos_l[1], ranges.pos_p[1], ranges.pos_y[1]])
@@ -624,8 +628,8 @@ class MouseIKController:
             self.goal_cfg, candidate, self.target_sphere
         )
 
-    def process_events(self, gym, viewer, env, anchor_pose):
-        for event in gym.query_viewer_action_events(viewer):
+    def process_events(self, gym, viewer, env, anchor_pose, events):
+        for event in events:
             if event.action == "ee_target_drag":
                 self.dragging = event.value > 0.0
                 if self.dragging:
@@ -706,25 +710,36 @@ def update_arm_position_ik(
     return current_world, np.linalg.norm(position_error)
 
 
-def set_joint_targets(gym, env, actor, asset, dof_props, use_ik_seed=False):
+def set_joint_targets(
+    gym, env, actor, asset, dof_props, robot_cfg, arm_joint_names, use_ik_seed=False
+):
     dof_names = gym.get_asset_dof_names(asset)
     dof_states = np.zeros(len(dof_names), dtype=gymapi.DofState.dtype)
     targets = np.zeros(len(dof_names), dtype=np.float32)
+    default_joints = robot_cfg.init_state.default_joint_angles
+    arm_gains = dict(zip(arm_joint_names, (ARM_GAINS[n] for n in ARM_JOINT_NAMES)))
+    ik_seed = dict(zip(arm_joint_names, (IK_ARM_SEED[n] for n in ARM_JOINT_NAMES)))
 
     for i, name in enumerate(dof_names):
-        if use_ik_seed and name in IK_ARM_SEED:
-            default_pos = IK_ARM_SEED[name]
+        if use_ik_seed and name in ik_seed:
+            default_pos = ik_seed[name]
         else:
-            default_pos = B2_Z1_DEFAULT_JOINTS.get(name, 0.0)
+            default_pos = default_joints.get(name, 0.0)
+        if dof_props["hasLimits"][i]:
+            default_pos = np.clip(
+                default_pos, dof_props["lower"][i], dof_props["upper"][i]
+            )
         dof_states["pos"][i] = default_pos
         targets[i] = default_pos
 
-        if name in ARM_GAINS:
+        if name in arm_gains:
             if use_ik_seed:
                 # Responsive and well damped for the 60 Hz interactive servo.
                 stiffness, damping = 400.0, 20.0
             else:
-                stiffness, damping = ARM_GAINS[name]
+                stiffness, damping = arm_gains[name]
+        elif name == "z1_jointGripper":
+            stiffness, damping = 80.0, 5.0
         else:
             stiffness, damping = 250.0, 5.0
 
@@ -741,10 +756,6 @@ def set_joint_targets(gym, env, actor, asset, dof_props, use_ik_seed=False):
 def main():
     args = parse_args()
     asset_path = resolve_asset_path(args.asset_file)
-    ee_goal_cfg = B2Z1RoughCfg.goal_ee
-    ee_range_geometry = None
-    if args.show_ee_range:
-        ee_range_geometry = make_ee_sampling_geometry(ee_goal_cfg, args.ee_samples)
 
     load_path = asset_path
     temporary_asset_path = None
@@ -791,6 +802,27 @@ def main():
     if asset is None:
         raise RuntimeError(f"Failed to load asset: {asset_path}")
 
+    body_names = gym.get_asset_rigid_body_names(asset)
+    dof_names = gym.get_asset_dof_names(asset)
+    robot_name, robot_cfg, arm_joint_names = detect_robot_config(dof_names)
+    gripper_name = robot_cfg.asset.gripper_name
+    if (
+        robot_name == "b2z1"
+        and "z1_jointGripper" not in dof_names
+        and gripper_name not in body_names
+    ):
+        # Older B2-Z1 assets have a fixed jaw and no separate grasp frame.
+        gripper_name = "gripperMover"
+    gripper_dof_index = (
+        dof_names.index("z1_jointGripper")
+        if "z1_jointGripper" in dof_names
+        else None
+    )
+    ee_goal_cfg = robot_cfg.goal_ee
+    ee_range_geometry = None
+    if args.show_ee_range:
+        ee_range_geometry = make_ee_sampling_geometry(ee_goal_cfg, args.ee_samples)
+
     env = gym.create_env(
         sim,
         gymapi.Vec3(-1.5, -1.5, 0.0),
@@ -799,7 +831,7 @@ def main():
     )
     pose = gymapi.Transform()
     pose.p = gymapi.Vec3(*args.root_pos)
-    actor = gym.create_actor(env, asset, pose, "b2_z1", 0, 0, 0)
+    actor = gym.create_actor(env, asset, pose, robot_name, 0, 0, 0)
 
     dof_props = gym.get_asset_dof_properties(asset)
     dof_targets = set_joint_targets(
@@ -808,17 +840,18 @@ def main():
         actor,
         asset,
         dof_props,
+        robot_cfg,
+        arm_joint_names,
         use_ik_seed=args.mouse_ik and not args.headless,
     )
 
-    body_names = gym.get_asset_rigid_body_names(asset)
-    dof_names = gym.get_asset_dof_names(asset)
-    base_body_index = body_names.index(B2Z1RoughCfg.asset.base_name)
-    gripper_body_index = body_names.index(B2Z1RoughCfg.asset.gripper_name)
+    base_body_index = body_names.index(robot_cfg.asset.base_name)
+    gripper_body_index = body_names.index(gripper_name)
     arm_dof_indices = np.array(
-        [dof_names.index(name) for name in ARM_JOINT_NAMES], dtype=np.int64
+        [dof_names.index(name) for name in arm_joint_names], dtype=np.int64
     )
     print(f"Loaded asset: {asset_path}")
+    print(f"Detected robot: {robot_name}")
     print(f"Rigid bodies: {len(body_names)}")
     print(f"DOFs: {len(dof_names)}")
     print(
@@ -834,7 +867,7 @@ def main():
         print("Body names:", body_names)
         print("DOF names:", dof_names)
     if args.show_ee_range:
-        print("EE goal sampling range: task=b2z1")
+        print(f"EE goal sampling range: task={robot_name}")
         print(
             "  center offset [m]:",
             [
@@ -888,6 +921,10 @@ def main():
             gymapi.Vec3(*args.camera_pos),
             gymapi.Vec3(*args.camera_lookat),
         )
+        if gripper_dof_index is not None:
+            gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_O, "gripper_open")
+            gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_C, "gripper_close")
+            print("Gripper control: O=open to the default angle, C=close")
         if args.mouse_ik:
             from isaacgym import gymtorch
 
@@ -895,10 +932,10 @@ def main():
                 ee_goal_cfg, viewer_props.horizontal_fov
             )
             mouse_ik.subscribe(gym, viewer)
-            jacobian_descriptor = gym.acquire_jacobian_tensor(sim, "b2_z1")
+            jacobian_descriptor = gym.acquire_jacobian_tensor(sim, robot_name)
             jacobian = gymtorch.wrap_tensor(jacobian_descriptor)
             gripper_handle = gym.find_actor_rigid_body_handle(
-                env, actor, B2Z1RoughCfg.asset.gripper_name
+                env, actor, gripper_name
             )
             jacobian_body_index = (
                 gripper_body_index - 1 if args.fix_base else gripper_body_index
@@ -917,7 +954,8 @@ def main():
             print("Mouse IK control enabled:")
             print("  left-drag: move the magenta EE target in the view plane")
             print("  mouse wheel: change target radius r by 0.03 m")
-            print("  target is clamped to b2z1 r/p/y limits and IK drives joint1..6")
+            print(f"  target is clamped to {robot_name} r/p/y limits")
+            print("  IK arm joints:", ", ".join(arm_joint_names))
 
     step = 0
     current_ee_world = None
@@ -932,6 +970,26 @@ def main():
         gym.simulate(sim)
         gym.fetch_results(sim, True)
 
+        viewer_events = (
+            list(gym.query_viewer_action_events(viewer)) if viewer is not None else []
+        )
+        if gripper_dof_index is not None:
+            for event in viewer_events:
+                if event.value <= 0.0:
+                    continue
+                if event.action == "gripper_open":
+                    angle = robot_cfg.init_state.default_joint_angles["z1_jointGripper"]
+                elif event.action == "gripper_close":
+                    angle = 0.0
+                else:
+                    continue
+                dof_targets[gripper_dof_index] = np.clip(
+                    angle,
+                    dof_props["lower"][gripper_dof_index],
+                    dof_props["upper"][gripper_dof_index],
+                )
+                gym.set_actor_dof_position_targets(env, actor, dof_targets)
+
         anchor_pose = None
         if viewer is not None and (
             ee_range_geometry is not None or mouse_ik is not None
@@ -941,7 +999,7 @@ def main():
             )
 
         if mouse_ik is not None:
-            mouse_ik.process_events(gym, viewer, env, anchor_pose)
+            mouse_ik.process_events(gym, viewer, env, anchor_pose, viewer_events)
             target_ee_world = mouse_ik.world_target(anchor_pose)
             current_ee_world, ik_position_error = update_arm_position_ik(
                 gym,

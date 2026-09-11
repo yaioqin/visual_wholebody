@@ -183,7 +183,7 @@ def get_args(test=False):
         {"name": "--rl_device", "type": str, "default": "cuda:0", "help": 'Device used by the RL algorithm, (cpu, gpu, cuda:0, cuda:1 etc..)'},
         {"name": "--num_envs", "type": int, "help": "Number of environments to create. Overrides config file if provided."},
         {"name": "--seed", "type": int, "help": "Random seed. Overrides config file if provided."},
-        {"name": "--max_iterations", "type": int, "help": "Maximum number of training iterations. Overrides config file if provided."},
+        {"name": "--max_iterations", "type": int, "help": "Total target iteration, including iterations completed before resuming. Overrides config file if provided."},
         {"name": "--stochastic", "action": "store_true", "default": False, "help": "Use stochastic actions to play"},
         {"name": "--use_jit", "action": "store_true", "default": False,  "help": "Use jit to play"},
         {"name": "--record_video", "action": "store_true", "default": False,  "help": "Record video to play"},

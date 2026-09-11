@@ -91,7 +91,8 @@
   </joint>
 
   <link name="FL_foot">
-    <visual><geometry><mesh filename="../assets/FL_foot.obj" scale="1 1 1" /></geometry><material name="green" /></visual>
+    <!-- Foot OBJ vertices use the calf frame; undo the foot joint's -0.35 m offset. -->
+    <visual><origin xyz="0 0 0.35" rpy="0 0 0" /><geometry><mesh filename="../assets/FL_foot.obj" scale="1 1 1" /></geometry><material name="green" /></visual>
     <collision><geometry><sphere radius="0.032" /></geometry></collision>
     <inertial><mass value="0.08" /><inertia ixx="0.00003" ixy="0" ixz="0" iyy="0.00003" iyz="0" izz="0.00003" /></inertial>
   </link>
@@ -145,7 +146,8 @@
   </joint>
 
   <link name="FR_foot">
-    <visual><geometry><mesh filename="../assets/FR_foot.obj" scale="1 1 1" /></geometry><material name="green" /></visual>
+    <!-- Foot OBJ vertices use the calf frame; undo the foot joint's -0.35 m offset. -->
+    <visual><origin xyz="0 0 0.35" rpy="0 0 0" /><geometry><mesh filename="../assets/FR_foot.obj" scale="1 1 1" /></geometry><material name="green" /></visual>
     <collision><geometry><sphere radius="0.032" /></geometry></collision>
     <inertial><mass value="0.08" /><inertia ixx="0.00003" ixy="0" ixz="0" iyy="0.00003" iyz="0" izz="0.00003" /></inertial>
   </link>
@@ -199,7 +201,8 @@
   </joint>
 
   <link name="RL_foot">
-    <visual><geometry><mesh filename="../assets/RL_foot.obj" scale="1 1 1" /></geometry><material name="green" /></visual>
+    <!-- Foot OBJ vertices use the calf frame; undo the foot joint's -0.35 m offset. -->
+    <visual><origin xyz="0 0 0.35" rpy="0 0 0" /><geometry><mesh filename="../assets/RL_foot.obj" scale="1 1 1" /></geometry><material name="green" /></visual>
     <collision><geometry><sphere radius="0.032" /></geometry></collision>
     <inertial><mass value="0.08" /><inertia ixx="0.00003" ixy="0" ixz="0" iyy="0.00003" iyz="0" izz="0.00003" /></inertial>
   </link>
@@ -253,7 +256,8 @@
   </joint>
 
   <link name="RR_foot">
-    <visual><geometry><mesh filename="../assets/RR_foot.obj" scale="1 1 1" /></geometry><material name="green" /></visual>
+    <!-- Foot OBJ vertices use the calf frame; undo the foot joint's -0.35 m offset. -->
+    <visual><origin xyz="0 0 0.35" rpy="0 0 0" /><geometry><mesh filename="../assets/RR_foot.obj" scale="1 1 1" /></geometry><material name="green" /></visual>
     <collision><geometry><sphere radius="0.032" /></geometry></collision>
     <inertial><mass value="0.08" /><inertia ixx="0.00003" ixy="0" ixz="0" iyy="0.00003" iyz="0" izz="0.00003" /></inertial>
   </link>
@@ -364,8 +368,13 @@
 
   <link name="gripperStator">
     <visual><geometry><mesh filename="../assets/z1_GripperStator.stl" scale="1 1 1" /></geometry><material name="silver" /></visual>
-    <!-- A single bounding box replaces the convex collision-mesh pieces. -->
-    <collision><origin xyz="0.071 0 -0.00175" rpy="0 0 0" /><geometry><box size="0.156 0.082 0.069" /></geometry></collision>
+    <!-- Preserve the jaw opening and hinge clearance for the movable gripper. -->
+    <collision><geometry><mesh filename="../assets/z1_GripperStator_col_1.stl" /></geometry></collision>
+    <collision><geometry><mesh filename="../assets/z1_GripperStator_col_2.stl" /></geometry></collision>
+    <collision><geometry><mesh filename="../assets/z1_GripperStator_col_3.stl" /></geometry></collision>
+    <collision><geometry><mesh filename="../assets/z1_GripperStator_col_4.stl" /></geometry></collision>
+    <collision><geometry><mesh filename="../assets/z1_GripperStator_col_5.stl" /></geometry></collision>
+    <collision><geometry><mesh filename="../assets/z1_GripperStator_col_6.stl" /></geometry></collision>
     <inertial><origin xyz="0.04764427 -0.00035819 -0.00249162" rpy="0 0 0" /><mass value="0.52603655" /><inertia ixx="0.00038683" ixy="-0.00000359" ixz="0.00007662" iyy="0.00068614" iyz="0.00000209" izz="0.00066293" /></inertial>
   </link>
   <joint name="gripperStator_fixed" type="fixed" dont_collapse="true">
@@ -376,13 +385,33 @@
 
   <link name="gripperMover">
     <visual><geometry><mesh filename="../assets/z1_GripperMover.stl" scale="1 1 1" /></geometry><material name="silver" /></visual>
-    <!-- A single bounding box replaces the convex collision-mesh pieces. -->
-    <collision><origin xyz="0.03935 0 0.00249" rpy="0 0 0" /><geometry><box size="0.1213 0.082 0.0476" /></geometry></collision>
+    <collision><geometry><mesh filename="../assets/z1_GripperMover_col_1.stl" /></geometry></collision>
+    <collision><geometry><mesh filename="../assets/z1_GripperMover_col_2.stl" /></geometry></collision>
+    <collision><geometry><mesh filename="../assets/z1_GripperMover_col_3.stl" /></geometry></collision>
+    <collision><geometry><mesh filename="../assets/z1_GripperMover_col_4.stl" /></geometry></collision>
+    <collision><geometry><mesh filename="../assets/z1_GripperMover_col_5.stl" /></geometry></collision>
     <inertial><origin xyz="0.01320633 0.00476708 0.00380534" rpy="0 0 0" /><mass value="0.27621302" /><inertia ixx="0.00017716" ixy="0.00001683" ixz="-0.00001786" iyy="0.00026787" iyz="0.00000262" izz="0.00035728" /></inertial>
   </link>
-  <joint name="gripperMover_fixed" type="fixed" dont_collapse="true">
+  <!-- Match the B1-Z1 movable jaw: zero is closed, negative angles open it. -->
+  <joint name="z1_jointGripper" type="revolute">
     <origin xyz="0.049 0 0" rpy="0 0 0" />
     <parent link="gripperStator" />
     <child link="gripperMover" />
+    <axis xyz="0 1 0" />
+    <dynamics damping="1.0" friction="1.0" />
+    <limit effort="30.0" lower="-1.5707963267948966" upper="0.0" velocity="10" />
   </joint>
+
+  <!-- The grasp frame stays on the stator when the movable jaw opens. -->
+  <joint name="ee_gripper" type="fixed" dont_collapse="true">
+    <origin xyz="0.135 0 0" rpy="0 0 0" />
+    <parent link="gripperStator" />
+    <child link="ee_gripper_link" />
+  </joint>
+  <link name="ee_gripper_link">
+    <inertial>
+      <mass value="0.001" />
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001" />
+    </inertial>
+  </link>
 </robot>
