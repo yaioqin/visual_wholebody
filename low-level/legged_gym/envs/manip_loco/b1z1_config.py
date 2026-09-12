@@ -55,9 +55,12 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
             pos_p = [-1 * np.pi / 2.5, 1 * np.pi / 3]
             pos_y = [-1.2, 1.2]
             
-            delta_orn_r = [-0.5, 0.5]
-            delta_orn_p = [-0.5, 0.5]
-            delta_orn_y = [-0.5, 0.5]
+            # delta_orn_r = [-0.5, 0.5]
+            # delta_orn_p = [-0.5, 0.5]
+            # delta_orn_y = [-0.5, 0.5]
+            delta_orn_r = [-1.5, 1.5]
+            delta_orn_p = [-1.2, 1.6]
+            delta_orn_y = [-0.8, 0.8]
             final_tracking_ee_reward = 0.55
 
         sphere_error_scale = [1, 1, 1]#[1 / (ranges.final_pos_l[1] - ranges.final_pos_l[0]), 1 / (ranges.final_pos_p[1] - ranges.final_pos_p[0]), 1 / (ranges.final_pos_y[1] - ranges.final_pos_y[0])]
@@ -271,7 +274,8 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
             orientation = 0.0
             orientation_walking = 0.0
             orientation_standing = 0.0
-            base_height = -5.0
+            # base_height = -5.0
+            base_height = -4.0
             torques_walking = 0.0
             torques_standing = 0.0
             energy_square = 0.0
@@ -284,7 +288,8 @@ class B1Z1RoughCfg( LeggedRobotCfg ):
         class arm_scales:
             arm_termination = None
             tracking_ee_sphere = 0.
-            tracking_ee_world = 0.8
+            # tracking_ee_world = 0.8
+            tracking_ee_world = -4.0
             tracking_ee_sphere_walking = 0.0
             tracking_ee_sphere_standing = 0.0
             tracking_ee_cart = None

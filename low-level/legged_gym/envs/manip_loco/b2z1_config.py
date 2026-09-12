@@ -199,7 +199,7 @@ class B2Z1ReachableWorkspaceMotionCfg(B2Z1ReachableWorkspaceCfg):
             feet_drag = -0.10
 
         class arm_scales(B2Z1ReachableWorkspaceCfg.rewards.arm_scales):
-            tracking_ee_world = 1.2
+            tracking_ee_world = 1.5
 
 
 class B2Z1ReachableWorkspaceMotionCfgPPO(B2Z1ReachableWorkspaceCfgPPO):
@@ -251,7 +251,7 @@ class B2Z1ReachableWorkspaceMotionPlusCfg(B2Z1ReachableWorkspaceMotionCfg):
             feet_drag = -0.10
 
         class arm_scales(B2Z1ReachableWorkspaceCfg.rewards.arm_scales):
-            tracking_ee_world = 0.8
+            tracking_ee_world = 1.5
 
 
 class B2Z1ReachableWorkspaceMotionPlusCfgPPO(B2Z1ReachableWorkspaceMotionCfgPPO):
@@ -283,7 +283,7 @@ class B2Z1ReachableBalancedCfg(B2Z1ReachableWorkspaceCfg):
             torques = -1.0e-5
 
         class arm_scales(B2Z1ReachableWorkspaceCfg.rewards.arm_scales):
-            tracking_ee_world = 0.8
+            tracking_ee_world = 1.5
 
 
 class B2Z1ReachableBalancedCfgPPO(B2Z1ReachableWorkspaceCfgPPO):

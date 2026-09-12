@@ -130,7 +130,7 @@ def parse_args():
         "--root-pos",
         type=float,
         nargs=3,
-        default=[0.0, 0.0, 0.55],
+        default=[0.0, 0.0, 0.45],
         metavar=("X", "Y", "Z"),
         help="Actor root position.",
     )

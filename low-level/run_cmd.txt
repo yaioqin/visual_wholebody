@@ -58,7 +58,7 @@ python play.py --exptid b2_z1 --task b2z1 --proj_name b2z1-low --checkpoint 4400
 python train.py --headless --exptid b2_z1 --proj_name b2z1-low --task b2z1 --sim_device cuda:0 --rl_device cuda:0 --observe_gait_commands 
 
 python play.py --exptid b2_z1 --task b2z1 --proj_name b2z1-low --checkpoint 44000 --observe_gait_commands --sim_device cuda:0 --rl_device cuda:0   --record_video
-
+python play.py --exptid b2_z1_change_ee_orn_range --task b2z1 --proj_name b2z1-low --checkpoint 44000 --observe_gait_commands --sim_device cuda:0 --rl_device cuda:0  
 --headless 
 low-level/legged_gym/scripts/visualize_b2_z1_urdf.py 可视化b2_z1脚本 
 
@@ -74,3 +74,16 @@ python visualize_b2_z1_urdf.py \
   --asset-file ../../resources/robots/b2_z1_lidar_mount_fast/urdf/b2_z1_lidar_mount_fast.urdf \
   --fix-base \
   --sim-device cuda:0
+
+
+python train.py \
+  --headless \
+  --exptid b2_z1_change_ee_orn_range \
+  --proj_name b2z1-low \
+  --task b2z1 \
+  --resumeid b2_z1_change_ee_pos_range \
+  --checkpoint 37000 \
+  --max_iterations 45000 \
+  --sim_device cuda:0 \
+  --rl_device cuda:0 \
+  --observe_gait_commands
