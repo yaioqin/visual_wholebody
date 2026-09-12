@@ -40,16 +40,16 @@ import torch
 from typing import Tuple, Dict
 
 from legged_gym.envs.base.legged_robot import LeggedRobot
+from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg
 from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.utils.helpers import class_to_dict
 from legged_gym.utils.terrain import Terrain, Terrain_Perlin
-from .b1z1_config import B1Z1RoughCfg
 
 import sys
 
 class ManipLoco(LeggedRobot):
     name = None
-    cfg: B1Z1RoughCfg
+    cfg: LeggedRobotCfg
 
     def __init__(self, cfg, *args, **kwargs):
         if cfg.env.observe_gait_commands:
@@ -67,7 +67,10 @@ class ManipLoco(LeggedRobot):
             actions (torch.Tensor): Tensor of shape (num_envs, num_actions_per_env)
             前12维是底盘控制，后6维是机械臂控制
         """
-        actions[:, 12:] = 0. 
+        # Keep the caller's rollout action tensor unchanged.  The arm remains
+        # controlled by IK below, so only the local copy is masked.
+        actions = actions.clone()
+        actions[:, 12:] = 0.
         actions = self._reindex_all(actions)
         actions = torch.clip(actions, -self.clip_actions, self.clip_actions).to(self.device)
         # step physics and render each frame
@@ -215,7 +218,7 @@ class ManipLoco(LeggedRobot):
     def compute_observations(self):
         """ Computes observations
         """
-        arm_base_pos = self.base_pos + quat_apply(self.base_yaw_quat, self.arm_base_offset)
+        arm_base_pos = self.base_pos + quat_apply(self.base_quat, self.arm_base_offset)
         ee_goal_local_cart = quat_rotate_inverse(self.base_quat, self.curr_ee_goal_cart_world - arm_base_pos)
         if self.stand_by:
             self.commands[:] = 0.
@@ -483,6 +486,17 @@ class ManipLoco(LeggedRobot):
         rigid_shape_props_asset = self.gym.get_asset_rigid_shape_properties(robot_asset)
         self.body_names = self.gym.get_asset_rigid_body_names(robot_asset)
         self.body_names_to_idx = self.gym.get_asset_rigid_body_dict(robot_asset)
+        fallback_base_name = "trunk" if "trunk" in self.body_names_to_idx else (
+            "base_link" if "base_link" in self.body_names_to_idx else self.body_names[min(1, self.num_bodies - 1)]
+        )
+        self.base_body_name = getattr(self.cfg.asset, "base_body_name", fallback_base_name)
+        if self.base_body_name not in self.body_names_to_idx:
+            raise ValueError(
+                "Configured base body '{}' was not found in asset rigid bodies: {}".format(
+                    self.base_body_name, self.body_names
+                )
+            )
+        self.base_body_idx = self.body_names_to_idx[self.base_body_name]
         self.dof_names = self.gym.get_asset_dof_names(robot_asset)
         self.dof_wo_gripper_names = self.dof_names[:-self.cfg.env.num_gripper_joints]
         self.dof_names_to_idx = self.gym.get_asset_dof_dict(robot_asset)
@@ -636,7 +650,7 @@ class ManipLoco(LeggedRobot):
         if self.cfg.domain_rand.randomize_base_mass:
             rng_mass = self.cfg.domain_rand.added_mass_range
             rand_mass = np.random.uniform(rng_mass[0], rng_mass[1], size=(1, ))
-            props[1].mass += rand_mass
+            props[self.base_body_idx].mass += rand_mass
         else:
             rand_mass = np.zeros(1)
         
@@ -652,7 +666,7 @@ class ManipLoco(LeggedRobot):
             rng_com_y = self.cfg.domain_rand.added_com_range_y
             rng_com_z = self.cfg.domain_rand.added_com_range_z
             rand_com = np.random.uniform([rng_com_x[0], rng_com_y[0], rng_com_z[0]], [rng_com_x[1], rng_com_y[1], rng_com_z[1]], size=(3, ))
-            props[1].com += gymapi.Vec3(*rand_com)
+            props[self.base_body_idx].com += gymapi.Vec3(*rand_com)
         else:
             rand_com = np.zeros(3)
 
@@ -731,7 +745,10 @@ class ManipLoco(LeggedRobot):
         self.dof_vel_wo_gripper = self.dof_vel[:, :-self.cfg.env.num_gripper_joints]
         self.base_quat = self.root_states[:, 3:7]
         self.base_pos = self.root_states[:, :3]
-        self.arm_base_offset = torch.tensor([0.3, 0., 0.09], device=self.device, dtype=torch.float).repeat(self.num_envs, 1)
+        arm_base_offset = getattr(self.cfg.arm, "base_offset", [0.3, 0., 0.09])
+        self.arm_base_offset = torch.tensor(
+            arm_base_offset, device=self.device, dtype=torch.float
+        ).view(1, 3).repeat(self.num_envs, 1)
         # self.yaw_ema = euler_from_quat(self.base_quat)[2]
         base_yaw = euler_from_quat(self.base_quat)[2]
         self.base_yaw_euler = torch.cat([torch.zeros(self.num_envs, 2, device=self.device), base_yaw.view(-1, 1)], dim=1)
@@ -880,6 +897,12 @@ class ManipLoco(LeggedRobot):
         
         self.global_steps = 0
 
+    def on_checkpoint_loaded(self):
+        """Refresh state whose distribution depends on restored training progress."""
+        env_ids = torch.arange(self.num_envs, device=self.device)
+        self._resample_commands(env_ids)
+        self.compute_observations()
+
     def _reset_root_states(self, env_ids):
         """ Resets ROOT states position and velocities of selected environmments
             Sets base position based on the curriculum
@@ -1024,6 +1047,9 @@ class ManipLoco(LeggedRobot):
             self.desired_contact_states[:, 1] = smoothing_multiplier_FR
             self.desired_contact_states[:, 2] = smoothing_multiplier_RL
             self.desired_contact_states[:, 3] = smoothing_multiplier_RR
+
+            # Standing commands require all four feet in contact, regardless of gait phase.
+            self.desired_contact_states[~self._get_walking_cmd_mask()] = 1.0
     
     def _post_physics_step_callback(self):
         """ Callback called before computing terminations, rewards, and observations
