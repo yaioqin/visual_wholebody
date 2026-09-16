@@ -44,6 +44,7 @@ from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg
 from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.utils.helpers import class_to_dict
 from legged_gym.utils.terrain import Terrain, Terrain_Perlin
+from legged_gym.video import overlay_goal
 
 import sys
 
@@ -128,6 +129,9 @@ class ManipLoco(LeggedRobot):
         self.gym.refresh_net_contact_force_tensor(self.sim)
         self.gym.refresh_force_sensor_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
+        # Indexing by feet_indices creates copies, so refresh them for rewards.
+        self.foot_positions = self.rigid_body_state[:, self.feet_indices, :3]
+        self.foot_velocities = self.rigid_body_state[:, self.feet_indices, 7:10]
         self.gym.refresh_jacobian_tensors(self.sim)
         self.episode_length_buf += 1
         self.common_step_counter += 1
@@ -164,7 +168,7 @@ class ManipLoco(LeggedRobot):
         self.last_root_vel[:] = self.root_states[:, 7:13]
         self.last_torques[:] = self.torques[:]
 
-        if (self.viewer and self.enable_viewer_sync and self.debug_viz) or self.record_video:
+        if self.viewer and ((self.enable_viewer_sync and self.debug_viz) or self.record_video):
             self.gym.clear_lines(self.viewer)
             self._draw_ee_goal_curr()
             self._draw_ee_goal_traj()
@@ -639,12 +643,13 @@ class ManipLoco(LeggedRobot):
             camera_props.height = 480
             self._rendering_camera_handles = []
             for i in range(self.num_envs):
-                # root_pos = self.root_states[i, :3].cpu().numpy()
-                # cam_pos = root_pos + np.array([0, 1, 0.5])
-                cam_pos = np.array([0, 1, 0.5])
                 camera_handle = self.gym.create_camera_sensor(self.envs[i], camera_props)
+                if camera_handle < 0:
+                    raise RuntimeError(
+                        "Failed to create recording camera. Check that the simulation "
+                        "graphics device is available and the NVIDIA Vulkan driver is installed."
+                    )
                 self._rendering_camera_handles.append(camera_handle)
-                self.gym.set_camera_location(camera_handle, self.envs[i], gymapi.Vec3(*cam_pos), gymapi.Vec3(*0*cam_pos))
     
     def _process_rigid_body_props(self, props, env_id):
         if self.cfg.domain_rand.randomize_base_mass:
@@ -1200,20 +1205,20 @@ class ManipLoco(LeggedRobot):
                                     r=gymapi.Quat(self.ee_goal_orn_quat[i, 0], self.ee_goal_orn_quat[i, 1], self.ee_goal_orn_quat[i, 2], self.ee_goal_orn_quat[i, 3]))
             gymutil.draw_lines(axes_geom, self.gym, self.viewer, self.envs[i], pose)
 
+    def _get_ee_goal_trajectory(self, num_points=64):
+        # Use the same spherical interpolation and base-yaw frame as the controller.
+        t = torch.linspace(0, 1, num_points, device=self.device)[None, :, None]
+        sphere = torch.lerp(self.ee_start_sphere[:, None, :], self.ee_goal_sphere[:, None, :], t)
+        cart = sphere2cart(sphere.reshape(-1, 3))
+        yaw = self.base_yaw_quat[:, None, :].expand(-1, num_points, -1).reshape(-1, 4)
+        return quat_apply(yaw, cart).reshape(self.num_envs, num_points, 3) + self._get_ee_goal_spherical_center()[:, None, :]
+
     def _draw_ee_goal_traj(self):
         sphere_geom = gymutil.WireframeSphereGeometry(0.005, 8, 8, None, color=(1, 0, 0))
-        sphere_geom_yellow = gymutil.WireframeSphereGeometry(0.01, 16, 16, None, color=(1, 1, 0))
-
-        t = torch.linspace(0, 1, 10, device=self.device)[None, None, None, :]
-        ee_target_all_sphere = torch.lerp(self.ee_start_sphere[..., None], self.ee_goal_sphere[..., None], t).squeeze(0)
-        ee_target_all_cart_world = torch.zeros_like(ee_target_all_sphere)
-        for i in range(10):
-            ee_target_cart = sphere2cart(ee_target_all_sphere[..., i])
-            ee_target_all_cart_world[..., i] = quat_apply(self.base_yaw_quat, ee_target_cart)
-        ee_target_all_cart_world += self._get_ee_goal_spherical_center()[:, :, None]
+        trajectory = self._get_ee_goal_trajectory(num_points=10)
         for i in range(self.num_envs):
             for j in range(10):
-                pose = gymapi.Transform(gymapi.Vec3(ee_target_all_cart_world[i, 0, j], ee_target_all_cart_world[i, 1, j], ee_target_all_cart_world[i, 2, j]), r=None)
+                pose = gymapi.Transform(gymapi.Vec3(*trajectory[i, j]), r=None)
                 gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], pose)
 
     def _control_ik(self, dpose):
@@ -1333,18 +1338,30 @@ class ManipLoco(LeggedRobot):
 
     def render_record(self, mode="rgb_array"):
         if self.global_steps % 2 == 0:
+            # With no viewer, render() does not fetch GPU simulation results.
+            if self.device != 'cpu':
+                self.gym.fetch_results(self.sim, True)
             self.gym.step_graphics(self.sim)
-            self.gym.render_all_camera_sensors(self.sim)
-            imgs = []
+            # Set every camera before rendering, including the very first frame.
             for i in range(self.num_envs):
                 cam = self._rendering_camera_handles[i]
-                root_pos = self.root_states[i, :3].cpu().numpy()
-                cam_pos = root_pos + np.array([0, 2, 1])
+                # Root states are world coordinates; camera locations are env-local.
+                origin = self.gym.get_env_origin(self.envs[i])
+                root_pos = self.root_states[i, :3].cpu().numpy() - np.array([origin.x, origin.y, origin.z])
+                cam_pos = root_pos + np.array([0, 3, 1.5])
                 self.gym.set_camera_location(cam, self.envs[i], gymapi.Vec3(*cam_pos), gymapi.Vec3(*root_pos))
-                
+
+            self.gym.render_all_camera_sensors(self.sim)
+            trajectories = self._get_ee_goal_trajectory().detach().cpu().numpy()
+            goals = self.curr_ee_goal_cart_world.detach().cpu().numpy()
+            imgs = []
+            for i, cam in enumerate(self._rendering_camera_handles):
                 img = self.gym.get_camera_image(self.sim, self.envs[i], cam, gymapi.IMAGE_COLOR)
                 w, h = img.shape
-                imgs.append(img.reshape([w, h // 4, 4]))
+                rgb = img.reshape([w, h // 4, 4])[:, :, :3].copy()
+                view = self.gym.get_camera_view_matrix(self.sim, self.envs[i], cam)
+                projection = self.gym.get_camera_proj_matrix(self.sim, self.envs[i], cam)
+                imgs.append(overlay_goal(rgb, trajectories[i], goals[i], view, projection))
             return imgs
         return None
 

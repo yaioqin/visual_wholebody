@@ -29,6 +29,7 @@
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
 import os
+import runpy
 from datetime import datetime
 from typing import Tuple
 import torch
@@ -61,9 +62,28 @@ class TaskRegistry():
         self.curr_task_path = self.task_paths[name]
         return self.task_classes[name]
     
-    def get_cfgs(self, name) -> Tuple[LeggedRobotCfg, LeggedRobotCfgPPO]:
+    def get_cfgs(self, name, config_path=None) -> Tuple[LeggedRobotCfg, LeggedRobotCfgPPO]:
         train_cfg = self.train_cfgs[name]
         env_cfg = self.env_cfgs[name]
+        if config_path is not None:
+            config_path = os.path.abspath(os.path.expanduser(config_path))
+            if not os.path.isfile(config_path):
+                raise FileNotFoundError(f"Config file not found: {config_path}")
+            if not config_path.endswith(".py"):
+                raise ValueError(f"Config file must be a Python (.py) file: {config_path}")
+            config = runpy.run_path(config_path)
+            env_class_name = type(env_cfg).__name__
+            train_class_name = type(train_cfg).__name__
+            for class_name, base in ((env_class_name, LeggedRobotCfg),
+                                     (train_class_name, LeggedRobotCfgPPO)):
+                cls = config.get(class_name)
+                if not isinstance(cls, type) or not issubclass(cls, base):
+                    raise ValueError(
+                        f"Config file {config_path} must provide {class_name} "
+                        f"derived from {base.__name__} for task '{name}'.")
+            env_cfg = config[env_class_name]()
+            train_cfg = config[train_class_name]()
+            print(f"Using config file: {config_path}")
         # copy seed
         env_cfg.seed = train_cfg.seed
         return env_cfg, train_cfg
@@ -94,7 +114,7 @@ class TaskRegistry():
             raise ValueError(f"Task with name: {name} was not registered")
         if env_cfg is None:
             # load config files
-            env_cfg, _ = self.get_cfgs(name)
+            env_cfg, _ = self.get_cfgs(name, config_path=getattr(args, "config", None))
         # override cfg from args (if specified)
         env_cfg, _ = update_cfg_from_args(env_cfg, None, args)
         set_seed(env_cfg.seed)
@@ -135,7 +155,7 @@ class TaskRegistry():
             if name is None:
                 raise ValueError("Either 'name' or 'train_cfg' must be not None")
             # load config files
-            _, train_cfg = self.get_cfgs(name)
+            _, train_cfg = self.get_cfgs(name, config_path=getattr(args, "config", None))
         else:
             if name is not None:
                 print(f"'train_cfg' provided -> Ignoring 'name={name}'")
@@ -157,7 +177,8 @@ class TaskRegistry():
             runner = OnPolicyRunner(env, 
                                     train_cfg_dict, 
                                     log_dir, 
-                                    device=args.rl_device)
+                                    device=args.rl_device,
+                                    distributed=getattr(args, "distributed", False))
         #save resume path before creating a new log_dir
         resume = train_cfg.runner.resume
         if args.resumeid:

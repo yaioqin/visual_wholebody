@@ -12,6 +12,9 @@ setup(
     install_requires=['isaacgym',
                       'rsl-rl',
                       'matplotlib',
+                      'Pillow',
                       'wandb',
+                      'tensorboard',
+                      'tqdm',
                       'torchinfo']
 )

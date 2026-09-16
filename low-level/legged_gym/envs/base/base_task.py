@@ -53,9 +53,9 @@ class BaseTask():
         else:
             self.device = 'cpu'
 
-        # graphics device for rendering, -1 for no rendering
+        # Camera sensors need graphics even when there is no viewer window.
         self.graphics_device_id = self.sim_device_id
-        if self.headless == True:
+        if self.headless and not getattr(cfg.env, "record_video", False):
             self.graphics_device_id = -1
 
         self.num_envs = cfg.env.num_envs
@@ -207,5 +207,3 @@ class BaseTask():
                 cam_trans = torch.tensor([p.x, p.y, p.z], requires_grad=False, device=self.device)
                 look_at_pos = self.root_states[self.lookat_id, :3].clone()
                 self.lookat_vec = cam_trans - look_at_pos
-            
-            

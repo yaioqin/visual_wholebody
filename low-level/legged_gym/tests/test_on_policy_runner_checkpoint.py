@@ -32,6 +32,42 @@ def make_runner(env):
 
 
 class OnPolicyRunnerCheckpointTest(unittest.TestCase):
+    def test_worker_does_not_write_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "worker.pt"
+            runner = make_runner(CurriculumEnv())
+            runner.rank = 1
+            runner.save(path, it=1)
+            self.assertFalse(path.exists())
+
+    def test_history_optimizer_and_algorithm_schedule_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.pt"
+            source = make_runner(CurriculumEnv(global_steps=480))
+            source.alg.hist_encoder_optimizer = torch.optim.Adam(source.alg.actor_critic.parameters(), lr=2e-4)
+            source.alg.hist_encoder_optimizer.zero_grad()
+            source.alg.actor_critic(torch.ones(1, 2)).sum().backward()
+            source.alg.hist_encoder_optimizer.step()
+            source.alg.counter = 20
+            source.alg.learning_rate = 2e-4
+            source.save(path, it=19)
+
+            target = make_runner(CurriculumEnv())
+            target.alg.hist_encoder_optimizer = torch.optim.Adam(target.alg.actor_critic.parameters())
+            target.alg.counter = 0
+            target.alg.learning_rate = 1e-3
+            target.load(path)
+
+            self.assertEqual(target.alg.counter, 20)
+            self.assertEqual(target.alg.learning_rate, 2e-4)
+            self.assertEqual(target.env.global_steps, 480)
+            self.assertEqual(target.alg.hist_encoder_optimizer.param_groups[0]["lr"], 2e-4)
+            for source_parameter, target_parameter in zip(source.alg.actor_critic.parameters(), target.alg.actor_critic.parameters()):
+                source_state = source.alg.hist_encoder_optimizer.state[source_parameter]
+                target_state = target.alg.hist_encoder_optimizer.state[target_parameter]
+                for key in source_state:
+                    torch.testing.assert_close(source_state[key], target_state[key])
+
     def test_global_steps_round_trip_is_exact(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "model.pt"

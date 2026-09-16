@@ -177,12 +177,12 @@ class B2Z1RoughCfg(LeggedRobotCfg):
         tracking_ang_vel_yaw_schedule = [0, 1]
 
         # 含义：判断“有效旋转命令”的 yaw 角速度阈值，单位 rad/s。
-        # 作用：用于横向速度惩罚等逻辑的掩码；模型联动：【任务决定】。
-        ang_vel_yaw_clip = 0.5
+        # 作用：用于命令清零和运动掩码；与高层 B1 的阈值一致；模型联动：【任务决定】。
+        ang_vel_yaw_clip = 0.35
 
         # 含义：判断静止/行走命令的前向速度阈值，单位 m/s。
-        # 作用：影响 walking mask、零命令奖励和命令清零；模型联动：【任务决定】。
-        lin_vel_x_clip = 0.2
+        # 作用：影响 walking mask、零命令奖励和命令清零；与高层 B1 的阈值一致；模型联动：【任务决定】。
+        lin_vel_x_clip = 0.15
 
         class ranges:
             # 含义：前向速度采样范围 [min, max]，单位 m/s。

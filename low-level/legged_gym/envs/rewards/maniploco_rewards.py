@@ -189,7 +189,7 @@ class ManipLoco_rewards:
         return rew, rew
 
     def _reward_feet_jerk(self):
-        if not hasattr(self, "last_contact_forces"):            
+        if not hasattr(self.env, "last_contact_forces"):
             result = torch.zeros(self.env.num_envs).to(self.env.device)
         else:
             result = torch.sum(torch.norm(self.env.force_sensor_tensor - self.env.last_contact_forces, dim=-1), dim=-1)
