@@ -35,6 +35,7 @@ import isaacgym
 from legged_gym.envs import *
 from legged_gym.utils import  get_args, export_policy_as_jit, task_registry, Logger
 from legged_gym.utils.helpers import get_load_path
+from legged_gym.video import recording_schedule
 
 import numpy as np
 import torch
@@ -45,7 +46,7 @@ np.set_printoptions(precision=3, suppress=True)
 
 def play(args):
     log_pth = LEGGED_GYM_ROOT_DIR + "/logs/{}/".format(args.proj_name) + args.exptid
-    env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
+    env_cfg, train_cfg = task_registry.get_cfgs(name=args.task, config_path=getattr(args, "config", None))
     # override some parameters for testing
     env_cfg.env.num_envs = 1
     # env_cfg.commands.ranges.lin_vel_x = [-1, 1]
@@ -102,24 +103,26 @@ def play(args):
     mp4_writers = []
     if args.record_video:
         import imageio
+        video_fps, video_steps = recording_schedule(env.dt, args.video_duration)
         env.enable_viewer_sync = False
         for i in range(env.num_envs):
             video_name = args.exptid+ f'-{i}-' + str(checkpoint) +".mp4"
             run_name = log_pth.split("/")[-1]
-            path = f"../../logs/videos/{run_name}"
+            path = os.path.join(LEGGED_GYM_ROOT_DIR, "logs", "videos", run_name)
             if not os.path.exists(path):
                 os.makedirs(path)
             video_name = os.path.join(path, video_name)
-            mp4_writer = imageio.get_writer(video_name, fps=25)
+            mp4_writer = imageio.get_writer(video_name, fps=video_fps)
             mp4_writers.append(mp4_writer)
+            print("Recording video to:", video_name)
 
     if not args.record_video:
         traj_length = 1000*int(env.max_episode_length)
     else:
-        traj_length = int(env.max_episode_length)
+        traj_length = video_steps
 
     # env.update_command_curriculum()
-    env.reset()
+    obs, _ = env.reset()
     for i in range(traj_length):
         start_time = time.time()
         if args.use_jit:
